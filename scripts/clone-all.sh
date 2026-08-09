@@ -11,7 +11,7 @@
 #   ./clone-all.sh --dry-run          # print URLs only, no cloning
 # =============================================================================
 set -euo pipefail
-BASE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BASE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/.tmp"
 DRY="${1:-}"
 mkdir -p "$BASE_DIR"
 

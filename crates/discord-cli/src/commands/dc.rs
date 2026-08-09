@@ -483,7 +483,13 @@ pub async fn dc_history(
 }
 
 /// `dc read <CHANNEL>` — recent messages (default 50), AI-facing.
-pub async fn dc_read(ctx: &DcCtx, channel: &str, limit: usize, before: Option<u64>) -> ExitCode {
+pub async fn dc_read(
+    ctx: &DcCtx,
+    channel: &str,
+    limit: usize,
+    before: Option<u64>,
+    transcript: bool,
+) -> ExitCode {
     let mut client = match ctx.client().await {
         Ok(c) => c,
         Err(code) => return code,
@@ -498,8 +504,19 @@ pub async fn dc_read(ctx: &DcCtx, channel: &str, limit: usize, before: Option<u6
         .await
     {
         Ok(msgs) => {
-            let _ = output::emit(&msgs, ctx.format);
-            ExitCode::from(exit::OK)
+            if transcript {
+                // Compact plain-text transcript: `[HH:MM:SS] author: content`.
+                // ~5x smaller than JSON — the AI-summarization cronjob format.
+                for m in &msgs {
+                    let ts = m.timestamp.get(11..19).unwrap_or(&m.timestamp);
+                    let content = m.content.replace('\n', " ⏎ ");
+                    println!("[{ts}] {}: {content}", m.author);
+                }
+                ExitCode::from(exit::OK)
+            } else {
+                let _ = output::emit(&msgs, ctx.format);
+                ExitCode::from(exit::OK)
+            }
         }
         Err(e) => ExitCode::from(output::emit_error("ApiError", &e.to_string(), classify(&e))),
     }
@@ -1157,55 +1174,6 @@ pub async fn dc_delete(ctx: &DcCtx, channel: &str, message_id: &str, confirm: bo
     }
 }
 
-/// `dc bulk-delete <CHANNEL> -n <COUNT>` — delete the N most-recent messages.
-///
-/// Fetches the newest messages, collects their IDs, and bulk-deletes them
-/// (2-100 per call; single message falls back to delete_message). Only
-/// messages newer than 14 days can be bulk-deleted (Discord server-side).
-pub async fn dc_bulk_delete(ctx: &DcCtx, channel: &str, count: usize, confirm: bool) -> ExitCode {
-    if !(2..=100).contains(&count) {
-        eprintln!("bulk-delete needs -n between 2 and 100 (got {count})");
-        return ExitCode::from(exit::USAGE);
-    }
-    if !confirm {
-        eprintln!(
-            "This will bulk-delete the {count} most-recent messages in \"{channel}\". Add --confirm to proceed."
-        );
-        return ExitCode::from(exit::USAGE);
-    }
-    let mut client = match ctx.client().await {
-        Ok(c) => c,
-        Err(code) => return code,
-    };
-    let channel_id = match resolve_channel_id(&mut client, channel).await {
-        Ok(id) => id,
-        Err(code) => return code,
-    };
-    // Fetch the newest `count` messages to get their IDs.
-    let msgs = match client.fetch_messages(&channel_id, count, None, None).await {
-        Ok(m) => m,
-        Err(e) => {
-            return ExitCode::from(output::emit_error("ApiError", &e.to_string(), classify(&e)))
-        }
-    };
-    let ids: Vec<String> = msgs.into_iter().map(|m| m.message_id).collect();
-    if ids.len() < 2 {
-        eprintln!(
-            "bulk-delete needs at least 2 recent messages (found {})",
-            ids.len()
-        );
-        return ExitCode::from(exit::USAGE);
-    }
-    match client.bulk_delete_messages(&channel_id, &ids).await {
-        Ok(_) => {
-            let data = serde_json::json!({ "deleted": true, "channel_id": channel_id, "messages": ids.len() });
-            let _ = output::emit(&data, ctx.format);
-            ExitCode::from(exit::OK)
-        }
-        Err(e) => ExitCode::from(output::emit_error("ApiError", &e.to_string(), classify(&e))),
-    }
-}
-
 /// `dc react <CHANNEL> <MSG> <EMOJI>`
 pub async fn dc_react(ctx: &DcCtx, channel: &str, message_id: &str, emoji: &str) -> ExitCode {
     let mut client = match ctx.client().await {
@@ -1356,7 +1324,7 @@ pub async fn dispatch(ctx: &DcCtx, cmd: DcCmd) -> ExitCode {
             channel,
             limit,
             before,
-        } => dc_read(ctx, &channel, limit, before).await,
+        } => dc_read(ctx, &channel, limit, before, false).await,
         DcCmd::Members { guild, max } => dc_members(ctx, &guild, max).await,
         DcCmd::Info { guild } => dc_info(ctx, &guild).await,
         DcCmd::Search {

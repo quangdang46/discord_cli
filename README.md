@@ -156,7 +156,7 @@ discord watch --keyword "incident" --jsonl
 | `channels <GUILD>` | List text/announcement/forum channels |
 | `dms` | List DM + group-DM channels |
 | `history <CH> [-l N] [--before/--after]` | Paginated message history |
-| `read <CH> [-l N] [--before ID]` | Recent messages — the agent-facing read |
+| `read <CH> [-l N] [--before ID] [--transcript]` | Recent messages — the agent-facing read; `--transcript` = compact plain-text (≈5× smaller, ideal for AI summarization) |
 | `members <GUILD> [--max N]` | Guild members |
 | `info <GUILD>` | Guild name, member/online counts |
 | `guild-search <GUILD> <QUERY>` | Discord native search |
@@ -174,7 +174,6 @@ discord watch --keyword "incident" --jsonl
 | `send <CH> --text "..." [--file PATH]... [--reply ID] [--confirm]` | Send / reply / attach (gated; `--text -` reads stdin) |
 | `edit <CH> <MSG_ID> --text "..."` | Edit own message |
 | `delete <CH> <MSG_ID> [--confirm]` | Delete own message (gated) |
-| `bulk-delete <CH> -n <COUNT> [--confirm]` | Bulk-delete 2-100 recent messages (gated) |
 | `react` / `unreact` | Add / remove a reaction |
 | `pin <CH> <MSG_ID>` | Pin a message |
 | `dm-group create/add/remove` | Group-DM management (gated create) |

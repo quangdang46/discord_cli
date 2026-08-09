@@ -91,6 +91,10 @@ enum Command {
         /// Fetch messages before this snowflake.
         #[arg(long)]
         before: Option<u64>,
+        /// Compact plain-text transcript `[HH:MM:SS] author: content`
+        /// — ~5x smaller than JSON, ideal for AI summarization.
+        #[arg(long)]
+        transcript: bool,
     },
     /// List guild members.
     Members {
@@ -257,17 +261,6 @@ enum Command {
         /// Message ID.
         message_id: String,
         /// Confirm deletion.
-        #[arg(long)]
-        confirm: bool,
-    },
-    /// Bulk-delete recent messages in a channel (2-100; requires --confirm).
-    BulkDelete {
-        /// Channel name or ID.
-        channel: String,
-        /// Number of most-recent messages to delete (2-100).
-        #[arg(short, long, default_value_t = 10)]
-        count: usize,
-        /// Confirm deletion (never interactive).
         #[arg(long)]
         confirm: bool,
     },
@@ -890,7 +883,8 @@ async fn run() -> ExitCode {
             channel,
             limit,
             before,
-        }) => commands::dc::dc_read(ctx, &channel, limit, before).await,
+            transcript,
+        }) => commands::dc::dc_read(ctx, &channel, limit, before, transcript).await,
         Some(Command::Members { guild, max }) => commands::dc::dc_members(ctx, &guild, max).await,
         Some(Command::Info { guild }) => commands::dc::dc_info(ctx, &guild).await,
         Some(Command::GuildSearch {
@@ -1003,11 +997,6 @@ async fn run() -> ExitCode {
             message_id,
             confirm,
         }) => commands::dc::dc_delete(ctx, &channel, &message_id, confirm).await,
-        Some(Command::BulkDelete {
-            channel,
-            count,
-            confirm,
-        }) => commands::dc::dc_bulk_delete(ctx, &channel, count, confirm).await,
         Some(Command::React {
             channel,
             message_id,

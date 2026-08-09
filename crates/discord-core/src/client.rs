@@ -1436,36 +1436,6 @@ impl ApiClient {
         Ok(())
     }
 
-    /// `POST /channels/{id}/messages/bulk-delete` — bulk-delete messages.
-    ///
-    /// `message_ids` length must be 2..=100 (crate validates; single-message
-    /// falls back to `delete_message` at the CLI layer). Only messages newer
-    /// than 14 days can be bulk-deleted (Discord server-side).
-    pub async fn bulk_delete_messages(
-        &mut self,
-        channel_id: &str,
-        message_ids: &[String],
-    ) -> Result<()> {
-        if message_ids.len() < 2 || message_ids.len() > 100 {
-            anyhow::bail!(
-                "bulk-delete needs 2..=100 message IDs (got {})",
-                message_ids.len()
-            );
-        }
-        let cid: u64 = channel_id.parse().context("invalid channel id")?;
-        let inner = self.inner()?;
-        let ids: Vec<String> = message_ids.to_vec();
-        // POST returns 204 No Content; `post_no_response` discards the body.
-        inner
-            .post_no_response(
-                Route::BulkDeleteMessages { channel_id: cid },
-                serde_json::json!({ "messages": ids }),
-            )
-            .await
-            .context("POST bulk-delete failed")?;
-        Ok(())
-    }
-
     /// `PUT /channels/{id}/messages/{mid}/reactions/{emoji}/@me` — react.
     pub async fn add_reaction(
         &mut self,
