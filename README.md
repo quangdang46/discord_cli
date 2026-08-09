@@ -21,6 +21,40 @@ Built in Rust for AI agents and terminal-first humans: 75 commands, SQLite archi
 
 ---
 
+## Installation
+
+```bash
+# macOS / Linux — one-liner (downloads prebuilt binary)
+curl -fsSL "https://raw.githubusercontent.com/quangdang46/discord_cli/main/install.sh?$(date +%s)" | bash
+
+# With PATH auto-update + self-test
+curl -fsSL "https://raw.githubusercontent.com/quangdang46/discord_cli/main/install.sh?$(date +%s)" | bash -s -- --easy-mode --verify
+
+# Pin a specific version
+curl -fsSL "https://raw.githubusercontent.com/quangdang46/discord_cli/main/install.sh?$(date +%s)" | bash -s -- --version v0.1.0
+```
+
+```powershell
+# Windows PowerShell
+irm "https://raw.githubusercontent.com/quangdang46/discord_cli/main/install.ps1" | iex
+```
+
+**Prebuilt binaries** are attached to every GitHub release (Linux x86_64/aarch64 musl, macOS x86_64/aarch64, Windows x86_64) with `.sha256` checksums.
+
+```bash
+# From source (requires Rust 1.80+)
+cargo install --path crates/discord-cli --locked
+# or build the workspace binary
+cargo build --release && cp target/release/discord /usr/local/bin/
+```
+
+The workspace uses a `tokio_unstable` cfg for `discord-user-rs` (see `.cargo/config.toml`); `cargo build` handles it.
+
+---
+
+---
+
+
 ## 🤖 Agent Quickstart (Robot Mode)
 
 This tool is built for AI agents. Every command emits **machine-readable JSON/JSONL** — never a bare interactive UI.
@@ -244,37 +278,6 @@ Admin ops map 403 → **exit 4**. Full permission matrix + risk table: [docs/ADM
 | `tail <CH> [--once]` / `watch [--typing]` | Gateway live follow (invisible presence) |
 | `watch [--channel C] [--keyword K]` | Long-running JSONL stream for agents |
 | `serve` | MCP server (stdio, 43 tools) |
-
----
-
-## Installation
-
-```bash
-# macOS / Linux — one-liner (downloads prebuilt binary)
-curl -fsSL "https://raw.githubusercontent.com/quangdang46/discord_cli/main/install.sh?$(date +%s)" | bash
-
-# With PATH auto-update + self-test
-curl -fsSL "https://raw.githubusercontent.com/quangdang46/discord_cli/main/install.sh?$(date +%s)" | bash -s -- --easy-mode --verify
-
-# Pin a specific version
-curl -fsSL "https://raw.githubusercontent.com/quangdang46/discord_cli/main/install.sh?$(date +%s)" | bash -s -- --version v0.1.0
-```
-
-```powershell
-# Windows PowerShell
-irm "https://raw.githubusercontent.com/quangdang46/discord_cli/main/install.ps1" | iex
-```
-
-**Prebuilt binaries** are attached to every GitHub release (Linux x86_64/aarch64 musl, macOS x86_64/aarch64, Windows x86_64) with `.sha256` checksums.
-
-```bash
-# From source (requires Rust 1.80+)
-cargo install --path crates/discord-cli --locked
-# or build the workspace binary
-cargo build --release && cp target/release/discord /usr/local/bin/
-```
-
-The workspace uses a `tokio_unstable` cfg for `discord-user-rs` (see `.cargo/config.toml`); `cargo build` handles it.
 
 ---
 
