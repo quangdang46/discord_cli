@@ -62,6 +62,7 @@ pub async fn sync_channel(client: &mut ApiClient, channel_id: &str, limit: usize
 
     let (last_id, oldest_id) = ddb::get_sync_state(&conn, channel_id)?;
     let mut total = 0usize;
+    let mut new_msgs: Vec<discord_core::types::Message> = Vec::new();
 
     // Phase B (history backward) — always runs to backfill.
     let before = if oldest_id.is_empty() {
@@ -81,7 +82,7 @@ pub async fn sync_channel(client: &mut ApiClient, channel_id: &str, limit: usize
     // Phase A (new, forward) — only when we have a last cursor.
     if !last_id.is_empty() {
         let after: Option<u64> = last_id.parse().ok();
-        let new_msgs = client
+        new_msgs = client
             .fetch_messages(channel_id, limit, None, after)
             .await?;
         for m in &new_msgs {
@@ -91,17 +92,15 @@ pub async fn sync_channel(client: &mut ApiClient, channel_id: &str, limit: usize
         total += new_msgs.len();
     }
 
-    // Compute new cursors: newest = max id seen, oldest = min id seen.
-    let newest = msgs
-        .iter()
-        .map(|m| m.message_id.clone())
-        .max()
-        .unwrap_or_default();
-    let oldest = msgs
-        .iter()
-        .map(|m| m.message_id.clone())
-        .min()
-        .unwrap_or_default();
+    // Compute new cursors from BOTH phases: newest = max id seen across
+    // Phase B (history) and Phase A (new), oldest = min id seen. Previously
+    // only `msgs` (Phase B) was used, so last_message_id regressed whenever
+    // Phase A found newer messages, causing re-fetch of already-archived
+    // messages on the next sync (wasted requests + rate-limit risk).
+    let mut all_ids: Vec<&str> = msgs.iter().map(|m| m.message_id.as_str()).collect();
+    all_ids.extend(new_msgs.iter().map(|m| m.message_id.as_str()));
+    let newest = all_ids.iter().map(|s| *s).max().unwrap_or_default().to_string();
+    let oldest = all_ids.iter().map(|s| *s).min().unwrap_or_default().to_string();
     if !newest.is_empty() {
         ddb::update_sync_state(&conn, channel_id, &newest, &oldest)?;
     }
