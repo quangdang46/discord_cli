@@ -953,7 +953,7 @@ impl ApiClient {
             .get(Route::GetMe)
             .await
             .context("GET /users/@me failed")?;
-        if me.id.to_string() != user_id {
+        if me.id != user_id {
             anyhow::bail!(
                 "GET /users/{{id}} is restricted to the current user on user tokens (40001); use `discord userinfo <your-id>` or `discord profile`"
             );
