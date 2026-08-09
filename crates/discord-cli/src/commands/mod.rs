@@ -5,6 +5,7 @@
 
 pub mod dc;
 pub mod download;
+pub mod fetchlinks;
 pub mod local;
 pub mod sync;
 pub mod tail;

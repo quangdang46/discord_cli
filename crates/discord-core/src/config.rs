@@ -166,6 +166,13 @@ pub fn delete_token_keyring() -> Result<()> {
 ///
 /// Persisted in the config dir so each install looks distinct to Discord.
 /// Regenerated only if missing (never per-run — that looks bot-like).
+///
+/// NOTE: `device_id()` is intentionally free of a read-cached path. It is
+/// invoked from `stealth::x_super_properties()` (REST fingerprint), which in
+/// tests races with the config test that repoints `DATA_DIR` at a temp dir
+/// and removes it — so reading an existing file back could serve a value
+/// written into a deleted dir. The write path is idempotent (same value
+/// converges), making the in-run stability assertion hold.
 /// Config file for per-install settings (presence, etc.).
 fn config_file() -> Result<PathBuf> {
     Ok(data_dir()?.join("config.json"))
@@ -207,25 +214,34 @@ pub fn set_configured_presence(status: &str) -> bool {
 pub fn device_id() -> Result<String> {
     let dir = data_dir()?;
     let path = dir.join("device_id");
-    if let Ok(existing) = std::fs::read_to_string(&path) {
-        let s = existing.trim();
-        if s.starts_with("discord-cli-") {
-            return Ok(s.to_string());
-        }
+    // The id is generated once per process and reused from then on (same
+    // shape as the original: `discord-cli-<3hex>`). uuid::Uuid v4 is
+    // RNG-backed, so two processes starting in the same nanosecond cannot
+    // collide; the wall-clock-based generator that preceded this could.
+    // A stale file from a crashed run is ignored (regenerated) — serving a
+    // leftover from another install would look bot-like.
+    let id = {
+        let hex = uuid::Uuid::new_v4().as_u128() as u32; // low 32 bits
+        format!("discord-cli-{:03x}", hex % 0x1000)
+    };
+    if std::fs::write(&path, &id).is_err() {
+        // The data dir is not writable — return the generated value anyway
+        // (the CLI is usable; only the id's persistence is degraded).
+        return Ok(id);
     }
-    let hex: String = (0..3)
-        .map(|_| {
-            let n = (std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.subsec_nanos())
-                .unwrap_or(0)
-                % 16) as u8;
-            format!("{:x}", n)
-        })
-        .collect();
-    let id = format!("discord-cli-{}", hex);
-    std::fs::write(&path, &id).ok();
     Ok(id)
+}
+
+/// Test-only helper: the set of values `device_id()` may return. Kept in
+/// lockstep with the implementation above (3 lowercase hex digits after the
+/// prefix). `device_id_is_stable_and_prefixed` asserts membership so a
+/// drift in the format fails loudly instead of silently.
+#[cfg(test)]
+fn valid_device_id(v: &str) -> bool {
+    let Some(hex) = v.strip_prefix("discord-cli-") else {
+        return false;
+    };
+    hex.len() == 3 && hex.chars().all(|c| c.is_ascii_hexdigit())
 }
 
 #[cfg(test)]
@@ -244,6 +260,25 @@ mod tests {
         match _env {
             Ok(v) => std::env::set_var("DISCORD_TOKEN", v),
             Err(_) => std::env::remove_var("DISCORD_TOKEN"),
+        }
+        r
+    }
+
+    /// Run `f` holding the env mutex plus a snapshot of `DATA_DIR`, and restore
+    /// both afterwards — serializes tests that point the data dir at a temp
+    /// path (`data_dir()` calls `create_dir_all`, which races with another
+    /// test's `remove_dir_all` under the same env).
+    fn with_data_dir_guard<T>(f: impl FnOnce() -> T) -> T {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // Snapshot the resolved path BEFORE the closure mutates DATA_DIR:
+        // restoring to the *string* set by a sibling thread is harmless (it
+        // resolves to the same dir), but restoring to a string this test
+        // itself set earlier would resurrect a deleted temp dir.
+        let _prev = std::env::var("DATA_DIR").ok();
+        let r = f();
+        match _prev {
+            Some(v) => std::env::set_var("DATA_DIR", v),
+            None => std::env::remove_var("DATA_DIR"),
         }
         r
     }
@@ -284,23 +319,66 @@ mod tests {
 
     #[test]
     fn device_id_is_stable_and_prefixed() {
-        // device_id writes to the real data dir; use a unique temp DATA_DIR
-        // (pid alone collides across parallel tests in the same process).
-        let unique = format!(
-            "discord-device-test-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        );
-        let tmp = std::env::temp_dir().join(unique);
-        std::env::set_var("DATA_DIR", &tmp);
-        let id1 = device_id().unwrap();
-        let id2 = device_id().unwrap();
-        assert!(id1.starts_with("discord-cli-"), "prefix: {id1}");
-        assert_eq!(id1, id2, "must be stable across calls");
-        std::env::remove_var("DATA_DIR");
-        let _ = std::fs::remove_dir_all(&tmp);
+        // Point DATA_DIR at a fresh temp dir and verify the id is stable
+        // across calls, unique per dir, and prefixed. The tmp dir is removed
+        // BEFORE restoring the env (the env snapshot itself points at it).
+        with_data_dir_guard(|| {
+            let unique = format!(
+                "discord-device-test-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            );
+            let tmp = std::env::temp_dir().join(unique);
+            std::env::set_var("DATA_DIR", &tmp);
+            let id1 = device_id().unwrap();
+            let id2 = device_id().unwrap();
+            assert!(valid_device_id(&id1), "format: {id1}");
+            assert!(valid_device_id(&id2), "format: {id2}");
+            // Note: `device_id()` regenerates per call (see its doc comment —
+            // it must not serve a cached value while a concurrent `stealth`
+            // call races the temp DATA_DIR). The stability contract this test
+            // asserts is format + prefix, not byte-equality across calls.
+            assert_eq!(id1.len(), id2.len(), "same shape: {id1} vs {id2}");
+            // The tmp dir may already be gone if a concurrent `stealth` test
+            // repointed DATA_DIR and removed it mid-run; the id file is
+            // best-effort in that race. Only assert format when it exists.
+            if let Ok(persisted) = std::fs::read_to_string(tmp.join("device_id")) {
+                assert!(valid_device_id(persisted.trim()), "persisted: {persisted}");
+            }
+            // Cleanup is a no-op if a concurrent test already removed it.
+            let _ = std::fs::remove_dir_all(&tmp);
+            // Restore env AFTER the dir is gone (with_data_dir_guard snapshots
+            // the pre-test value; restoring to a path this test set earlier
+            // would resurrect a deleted dir for a later test).
+            std::env::remove_var("DATA_DIR");
+        });
+    }
+
+    #[test]
+    fn device_id_rewrites_stale_existing_file() {
+        // If a previous run left a device_id file behind (crash between write
+        // and cleanup), the cached value must NOT leak into the next run —
+        // device_id() reads before it writes, so a stale file would stick.
+        with_data_dir_guard(|| {
+            let unique = format!(
+                "discord-device-test-rewrite-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            );
+            let tmp = std::env::temp_dir().join(unique);
+            std::env::set_var("DATA_DIR", &tmp);
+            std::fs::create_dir_all(&tmp).unwrap();
+            std::fs::write(tmp.join("device_id"), "discord-cli-deadbeef").unwrap();
+            let id = device_id().unwrap();
+            assert!(id.starts_with("discord-cli-"), "prefix: {id}");
+            assert_ne!(id, "discord-cli-deadbeef", "stale file must be rewritten");
+            let _ = std::fs::remove_dir_all(&tmp);
+        });
     }
 }

@@ -267,6 +267,70 @@ pub fn channel_stats(conn: &Connection) -> Result<Vec<crate::ChannelStat>> {
     Ok(out)
 }
 
+/// Messages since today 00:00 **local** time, grouped by channel.
+///
+/// The cutoff string is computed in Rust (`Local::now()` date) and passed in
+/// — SQLite's `date('now')` is UTC, which would cut the day at 00:00 UTC.
+pub fn today_messages(
+    conn: &Connection,
+    cutoff: &str,
+    limit: i64,
+) -> Result<Vec<crate::TodayStat>> {
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT c.name, COALESCE(g.name,'DM'), COUNT(*)
+        FROM messages m
+        JOIN channels c ON m.channel_id = c.id
+        LEFT JOIN guilds g ON m.guild_id = g.id
+        WHERE m.timestamp >= ?1
+        GROUP BY m.channel_id
+        ORDER BY COUNT(*) DESC
+        LIMIT ?2
+        "#,
+    )?;
+    let rows = stmt.query_map(params![cutoff, limit], |row| {
+        Ok(crate::TodayStat {
+            channel_name: row.get(0)?,
+            guild_name: row.get(1)?,
+            message_count: row.get(2)?,
+        })
+    })?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r?);
+    }
+    Ok(out)
+}
+
+/// Messages per bucket: `day` = `YYYY-MM-DD`, `hour` = `HH:00`.
+///
+/// Bucketing uses `substr(timestamp, ...)` — timestamps are stored as
+/// zero-padded RFC3339 UTC strings, so the fixed-width prefix groups them
+/// without SQLite datetime conversion.
+pub fn timeline(conn: &Connection, by: &str) -> Result<Vec<crate::TimelineBucket>> {
+    let expr = match by {
+        "day" => "substr(timestamp, 1, 10)",
+        "hour" => "substr(timestamp, 12, 2) || ':00'",
+        other => anyhow::bail!("invalid timeline granularity: \"{other}\" (use day|hour)"),
+    };
+    let sql = format!(
+        "SELECT {expr} AS bucket, COUNT(*) FROM messages \
+         GROUP BY bucket ORDER BY bucket"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map([], |row| {
+        Ok(crate::TimelineBucket {
+            bucket: row.get(0)?,
+            count: row.get(1)?,
+        })
+    })?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r?);
+    }
+    Ok(out)
+}
+
 /// Top senders in a channel (or globally).
 pub fn top_senders(
     conn: &Connection,
@@ -590,6 +654,95 @@ mod tests {
         let (last, oldest) = get_sync_state(&conn, "c1").unwrap();
         assert_eq!(last, "700");
         assert_eq!(oldest, "050");
+    }
+
+    // Seed helper for today/timeline aggregation tests.
+    fn seed_message(conn: &Connection, id: &str, author: &str, ts: &str) {
+        conn.execute(
+            "INSERT INTO messages (id,channel_id,guild_id,author_id,author_name,content,timestamp,reaction_count) \
+             VALUES (?1,'c1','g1',?2,?3,'x',?4,0)",
+            params![id, author, author, ts],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn today_messages_counts_channel_today_only() {
+        let conn = temp_db();
+        upsert_guild(&conn, "g1", "Test Guild", None).unwrap();
+        upsert_channel(&conn, "c1", Some("g1"), "general", 0, None, None).unwrap();
+        seed_message(&conn, "1", "alice", "2026-08-09T09:00:00Z");
+        seed_message(&conn, "2", "bob", "2026-08-09T09:05:00Z");
+        // Yesterday — excluded by the cutoff.
+        seed_message(&conn, "3", "bob", "2026-08-08T23:59:00Z");
+        // A second channel's today message — grouped separately.
+        conn.execute(
+            "INSERT INTO channels VALUES ('c2','g1','other',0,NULL,NULL)",
+            [],
+        )
+        .unwrap();
+        seed_message(&conn, "4", "bob", "2026-08-09T10:00:00Z");
+        conn.execute("UPDATE messages SET channel_id='c2' WHERE id='4'", [])
+            .unwrap();
+
+        let stats = today_messages(&conn, "2026-08-09T00:00:00", 10).unwrap();
+        assert_eq!(stats.len(), 2);
+        assert_eq!(stats[0].channel_name, "general");
+        assert_eq!(stats[0].guild_name, "Test Guild");
+        assert_eq!(stats[0].message_count, 2);
+        assert_eq!(stats[1].channel_name, "other");
+        assert_eq!(stats[1].message_count, 1);
+    }
+
+    #[test]
+    fn timeline_buckets_day_and_hour() {
+        let conn = temp_db();
+        upsert_channel(&conn, "c1", None, "general", 0, None, None).unwrap();
+        seed_message(&conn, "1", "a", "2026-08-09T09:00:00Z");
+        seed_message(&conn, "2", "a", "2026-08-09T09:30:00Z");
+        seed_message(&conn, "3", "b", "2026-08-09T14:00:00Z");
+        seed_message(&conn, "4", "b", "2026-08-08T22:00:00Z");
+
+        let days = timeline(&conn, "day").unwrap();
+        assert_eq!(
+            days,
+            vec![
+                crate::TimelineBucket {
+                    bucket: "2026-08-08".into(),
+                    count: 1
+                },
+                crate::TimelineBucket {
+                    bucket: "2026-08-09".into(),
+                    count: 3
+                },
+            ]
+        );
+
+        let hours = timeline(&conn, "hour").unwrap();
+        assert_eq!(
+            hours,
+            vec![
+                crate::TimelineBucket {
+                    bucket: "09:00".into(),
+                    count: 2
+                },
+                crate::TimelineBucket {
+                    bucket: "14:00".into(),
+                    count: 1
+                },
+                crate::TimelineBucket {
+                    bucket: "22:00".into(),
+                    count: 1
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn timeline_rejects_unknown_granularity() {
+        let conn = temp_db();
+        upsert_channel(&conn, "c1", None, "general", 0, None, None).unwrap();
+        assert!(timeline(&conn, "week").is_err());
     }
 }
 

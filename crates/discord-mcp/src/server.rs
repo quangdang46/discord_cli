@@ -676,7 +676,13 @@ impl DiscordMcpServer {
         let mut c = self.client()?;
         let id = match req.files.as_deref() {
             None => c
-                .send_message(&req.channel_id, &req.content, req.reply_to.as_deref())
+                .send_message(
+                    &req.channel_id,
+                    &req.content,
+                    req.reply_to.as_deref(),
+                    0,
+                    &[],
+                )
                 .await
                 .map_err(|e| e.to_string())?,
             Some(paths) => {
@@ -711,6 +717,8 @@ impl DiscordMcpServer {
                     &req.content,
                     req.reply_to.as_deref(),
                     atts,
+                    0,
+                    &[],
                 )
                 .await
                 .map_err(|e| e.to_string())?

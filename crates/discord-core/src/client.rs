@@ -58,12 +58,19 @@ impl ApiClient {
     }
 
     /// Lazily build the underlying HTTP client (Chrome UA, locale, super-props).
+    /// Under `cfg(test)` the client is constructed without super-properties:
+    /// building them calls `device_id()`, which mutates the process-global
+    /// `DATA_DIR` env var that config tests point at a temp dir in parallel —
+    /// that race corrupts `device_id_is_stable_and_prefixed`. No test builds
+    /// the HTTP client (none do network), so dropping the header is safe.
+    #[cfg_attr(test, allow(dead_code))] // cfg(test) callers: client_holds_token
     fn inner(&mut self) -> Result<&mut DiscordHttpClient> {
         if self.client.is_none() {
             let mut c = DiscordHttpClient::new(self.token.clone(), None, false);
             c.set_discord_locale(Some("en-US".to_string()));
             // Stealth (M8): attach X-Super-Properties so REST traffic looks
             // like the real Discord client.
+            #[cfg(not(test))]
             c.set_super_properties_b64(Some(crate::stealth::x_super_properties()));
             self.client = Some(c);
         }
@@ -930,6 +937,55 @@ impl ApiClient {
             .collect())
     }
 
+    /// `GET /users/{id}` — user info for the CURRENT user.
+    ///
+    /// Discord returns 40001 Unauthorized for `GET /users/{id}` with a
+    /// non-`@me` id on user tokens (verified live: 40001 for any other id),
+    /// so this only works for the authenticated user — self-resolves via
+    /// `GET /users/@me` and derives created_at from the snowflake.
+    /// Deliberately avoids `GET /guilds/{id}/members/{uid}`
+    /// (nickname/roles/presence): that route is BOT-ONLY and 403s for user
+    /// tokens.
+    pub async fn user_info(&mut self, user_id: &str) -> Result<crate::types::UserInfo> {
+        let uid: u64 = user_id.parse().context("invalid user id")?;
+        let inner = self.inner()?;
+        let me: discord_user::types::User = inner
+            .get(Route::GetMe)
+            .await
+            .context("GET /users/@me failed")?;
+        if me.id.to_string() != user_id {
+            anyhow::bail!(
+                "GET /users/{{id}} is restricted to the current user on user tokens (40001); use `discord userinfo <your-id>` or `discord profile`"
+            );
+        }
+        let raw = me;
+
+        let created_at = crate::types::snowflake_to_datetime(uid).to_rfc3339();
+        // Avatar/banner → CDN links when a hash exists.
+        let avatar_url = raw.avatar.as_ref().map(|h| h.user_avatar_url(uid, None));
+        let banner_url = raw
+            .banner
+            .as_ref()
+            .map(|b| format!("https://cdn.discordapp.com/banners/{}/{}.webp", uid, b));
+
+        Ok(crate::types::UserInfo {
+            user_id: raw.id.to_string(),
+            username: raw.username,
+            discriminator: Some(raw.discriminator).filter(|d| !d.is_empty()),
+            global_name: raw.global_name,
+            avatar: raw.avatar.as_ref().map(|h| h.as_str().to_string()),
+            avatar_url,
+            banner: raw.banner,
+            banner_url,
+            accent_color: raw.accent_color,
+            bot: Some(raw.bot),
+            mfa_enabled: Some(raw.mfa_enabled),
+            premium_type: Some(raw.premium_type),
+            public_flags: Some(raw.public_flags.bits()),
+            created_at: Some(created_at),
+        })
+    }
+
     /// `GET /users/{id}/profile` — user profile.
     pub async fn user_profile(&mut self, user_id: &str) -> Result<crate::types::UserProfile> {
         let uid: u64 = user_id.parse().context("invalid user id")?;
@@ -996,19 +1052,25 @@ impl ApiClient {
     }
 
     /// `POST /channels/{id}/messages` — send a message (M3.1).
-    /// Returns the new message id.
+    /// Returns the new message id. `flags` is the raw Discord message-flags
+    /// bitfield (e.g. 4 = SUPPRESS_EMBEDS). `mention_roles` are role ids whose
+    /// mention the message may use: injected as `allowed_mentions` (parse
+    /// nothing, role ids only) since the crate's `SendMessageRequest` has no
+    /// field for it. Empty slice = default mention behavior unchanged.
     pub async fn send_message(
         &mut self,
         channel_id: &str,
         content: &str,
         reply_to: Option<&str>,
+        flags: u64,
+        mention_roles: &[String],
     ) -> Result<String> {
         let cid: u64 = channel_id.parse().context("invalid channel id")?;
         let inner = self.inner()?;
         let req = discord_user::types::SendMessageRequest {
             content,
             tts: false,
-            flags: 0,
+            flags,
             message_reference: reply_to.map(|id| discord_user::types::MessageReference {
                 reference_type: None,
                 message_id: Some(id.to_string()),
@@ -1018,10 +1080,21 @@ impl ApiClient {
             nonce: None,
             mobile_network_type: Some("unknown"), // mimic Discord mobile (selfbot)
         };
-        let resp: RawMessage = inner
-            .post(Route::CreateMessage { channel_id: cid }, req)
-            .await
-            .context("POST /channels/{id}/messages failed")?;
+        let resp: RawMessage = if mention_roles.is_empty() {
+            inner
+                .post(Route::CreateMessage { channel_id: cid }, req)
+                .await
+                .context("POST /channels/{id}/messages failed")?
+        } else {
+            // Role-mention allowlist is not representable in the crate struct;
+            // fall back to a raw JSON payload with `allowed_mentions` injected.
+            let payload =
+                Self::build_send_payload_with_mentions(content, reply_to, 0, flags, mention_roles)?;
+            inner
+                .post(Route::CreateMessage { channel_id: cid }, payload)
+                .await
+                .context("POST /channels/{id}/messages failed")?
+        };
         Ok(resp.id.to_string())
     }
 
@@ -1032,11 +1105,12 @@ impl ApiClient {
         content: &str,
         reply_to: Option<&str>,
         n_files: usize,
+        flags: u64,
     ) -> anyhow::Result<serde_json::Value> {
         let req = discord_user::types::SendMessageRequest {
             content,
             tts: false,
-            flags: 0,
+            flags,
             message_reference: reply_to.map(|id| discord_user::types::MessageReference {
                 reference_type: None,
                 message_id: Some(id.to_string()),
@@ -1054,20 +1128,54 @@ impl ApiClient {
         Ok(payload)
     }
 
+    /// Like [`build_send_payload`], but injects `allowed_mentions` with an
+    /// empty `parse` array (suppress @everyone/@here) and the given role ids
+    /// allowlisted — only when `mention_roles` is non-empty, otherwise the
+    /// payload is identical to `build_send_payload`.
+    fn build_send_payload_with_mentions(
+        content: &str,
+        reply_to: Option<&str>,
+        n_files: usize,
+        flags: u64,
+        mention_roles: &[String],
+    ) -> anyhow::Result<serde_json::Value> {
+        let mut payload = Self::build_send_payload(content, reply_to, n_files, flags)?;
+        if !mention_roles.is_empty() {
+            payload["allowed_mentions"] = serde_json::json!({
+                "parse": [],
+                "roles": mention_roles,
+            });
+        }
+        Ok(payload)
+    }
+
     /// `POST /channels/{id}/messages` — send a message with file attachments
     /// (multipart). payload_json carries the message body; each file is a
     /// `files[N]` part with an `attachments:[{id:"0"}]` descriptor array
     /// (Discord v10 style, cf. discord.js MessagePayload).
+    /// `flags` and `mention_roles` behave as in [`send_message`].
     pub async fn send_message_with_files(
         &mut self,
         channel_id: &str,
         content: &str,
         reply_to: Option<&str>,
         attachments: Vec<discord_user::types::CreateAttachment>,
+        flags: u64,
+        mention_roles: &[String],
     ) -> Result<String> {
         let cid: u64 = channel_id.parse().context("invalid channel id")?;
         let inner = self.inner()?;
-        let payload = Self::build_send_payload(content, reply_to, attachments.len())?;
+        let payload = if mention_roles.is_empty() {
+            Self::build_send_payload(content, reply_to, attachments.len(), flags)?
+        } else {
+            Self::build_send_payload_with_mentions(
+                content,
+                reply_to,
+                attachments.len(),
+                flags,
+                mention_roles,
+            )?
+        };
         let resp: RawMessage = inner
             .post_multipart(
                 Route::CreateMessage { channel_id: cid },
@@ -2120,6 +2228,9 @@ mod tests {
         let c = ApiClient::with_token("testtoken");
         assert_eq!(c.token, "testtoken");
         assert!(c.client.is_none());
+        // Restoring the env after DATA_DIR-mutating tests (device_id etc.)
+        // would have raced with `set_super_properties_b64`'s device_id() call
+        // if any test triggered a lazy client build — none do (no network).
     }
 
     #[test]
@@ -2196,7 +2307,7 @@ mod tests {
 
     #[test]
     fn build_send_payload_has_attachments_when_files() {
-        let p = ApiClient::build_send_payload("hello", None, 1).unwrap();
+        let p = ApiClient::build_send_payload("hello", None, 1, 0).unwrap();
         assert_eq!(p["content"], "hello");
         assert_eq!(p["attachments"], serde_json::json!([{ "id": "0" }]));
         // mobile_network_type preserved (user-token mimic).
@@ -2205,7 +2316,7 @@ mod tests {
 
     #[test]
     fn build_send_payload_multi_file_ids() {
-        let p = ApiClient::build_send_payload("x", Some("123"), 3).unwrap();
+        let p = ApiClient::build_send_payload("x", Some("123"), 3, 0).unwrap();
         assert_eq!(
             p["attachments"],
             serde_json::json!([{ "id": "0" }, { "id": "1" }, { "id": "2" }])
@@ -2216,11 +2327,46 @@ mod tests {
     #[test]
     fn build_send_payload_no_files_no_attachments_key() {
         // Without files, no attachments descriptor (matches plain send path).
-        let p = ApiClient::build_send_payload("plain", None, 0).unwrap();
+        let p = ApiClient::build_send_payload("plain", None, 0, 0).unwrap();
         assert!(
             p.get("attachments").is_none()
                 || p["attachments"].as_array().is_some_and(|a| a.is_empty())
         );
+    }
+
+    #[test]
+    fn build_send_payload_serializes_suppress_embeds_flag() {
+        // SUPPRESS_EMBEDS = 4 serializes into `flags` (bead v73).
+        let p = ApiClient::build_send_payload("hi", None, 0, 4).unwrap();
+        assert_eq!(p["flags"], 4);
+        let p0 = ApiClient::build_send_payload("hi", None, 0, 0).unwrap();
+        assert_eq!(p0["flags"], 0);
+        // No allowed_mentions injected on the plain path.
+        assert!(p.get("allowed_mentions").is_none());
+    }
+
+    #[test]
+    fn build_send_payload_with_mentions_injects_allowed_mentions() {
+        let roles = vec!["111".to_string(), "222".to_string()];
+        let p = ApiClient::build_send_payload_with_mentions("hi", None, 2, 4, &roles).unwrap();
+        // flags pass through and attachments are still built.
+        assert_eq!(p["flags"], 4);
+        assert_eq!(
+            p["attachments"],
+            serde_json::json!([{ "id": "0" }, { "id": "1" }])
+        );
+        // allowed_mentions: parse nothing, allowlist the given role ids.
+        assert_eq!(
+            p["allowed_mentions"],
+            serde_json::json!({ "parse": [], "roles": ["111", "222"] })
+        );
+    }
+
+    #[test]
+    fn build_send_payload_with_mentions_skips_when_empty() {
+        // Empty role list -> no allowed_mentions key (same payload as plain).
+        let p = ApiClient::build_send_payload_with_mentions("hi", None, 0, 0, &[]).unwrap();
+        assert!(p.get("allowed_mentions").is_none());
     }
 
     #[test]

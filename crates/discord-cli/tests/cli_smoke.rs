@@ -113,6 +113,38 @@ fn watch_command_exists() {
 }
 
 #[test]
+fn read_help_shows_around_flag() {
+    let out = Command::new(env!("CARGO_BIN_EXE_discord"))
+        .args(["read", "--help"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("--around"), "stdout: {stdout}");
+}
+
+#[test]
+fn read_around_conflicts_with_before_exits_2() {
+    // clap rejects --around + --before with usage exit 2 (before any network).
+    let out = Command::new(env!("CARGO_BIN_EXE_discord"))
+        .args(["read", "123", "--around", "456", "--before", "789"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("--around"), "stderr: {stderr}");
+}
+
+#[test]
+fn userinfo_help_shows_usage() {
+    let out = Command::new(env!("CARGO_BIN_EXE_discord"))
+        .args(["userinfo", "--help"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("<USER_ID>"), "stdout: {stdout}");
+}
+
+#[test]
 fn dm_group_create_requires_confirm() {
     let out = Command::new(env!("CARGO_BIN_EXE_discord"))
         .args(["dm-group", "create", "123,456"])

@@ -15,7 +15,7 @@
 </div>
 
 **A Discord CLI + MCP server that operates your *user account* — so it sees every server, group, and DM you belong to. No bot invitation required.**  
-Built in Rust for AI agents and terminal-first humans: 75 commands, SQLite archive with FTS5 search, stealth-aware, and an MCP server that plugs straight into Claude Code.
+Built in Rust for AI agents and terminal-first humans: 77 commands, SQLite archive with FTS5 search, stealth-aware, and an MCP server that plugs straight into Claude Code.
 
 > ⚠️ **ToS / account-risk warning** — Automating a user account violates Discord's Terms of Service and can result in account termination. Use only on accounts you control, with restraint: rate limits are built in, reads are bounded, and destructive actions require explicit `--confirm`. Admin operations (`channel-*`, `role-*`, `emoji-*`) are the **highest-risk** surface — channel deletion is irreversible and plainly visible. `auth --qr` uses Discord's login API (highest risk) — opt-in only, never automatic. See [docs/ADMIN.md](docs/ADMIN.md) for the permission matrix and ToS risk table.
 
@@ -158,12 +158,16 @@ discord read "guide" -l 10 --json   # message_id, author, timestamp, content
 
 # Archive a channel for offline search
 discord sync "guide" -l 500         # → {"messages_synced": N}
+discord sync "guide" --follow       # backfill, then keep persisting new messages (gateway)
+discord sync "guide" --follow --max-duration 3600   # bounded follow (cron-friendly)
 discord search "release" -n 20      # FTS5 over the local SQLite archive
 discord stats --json                # per-channel counts
 
 # Act (gated)
 discord send "guide" --text "hi" --confirm       # requires --confirm
 discord send "guide" --text "re:" --reply <MSG_ID>  # reply is auto-approved
+discord send "guide" --text "https://x.com/..." --suppress-embeds  # no link preview
+discord send "guide" --text "@mods ping" --mention-roles 111 222    # role-mention allowlist
 discord react "guide" <MSG_ID> "👍"
 
 # Live follow a keyword
@@ -190,12 +194,13 @@ discord watch --keyword "incident" --jsonl
 | `channels <GUILD>` | List text/announcement/forum channels |
 | `dms` | List DM + group-DM channels |
 | `history <CH> [-l N] [--before/--after]` | Paginated message history |
-| `read <CH> [-l N] [--before ID] [--transcript]` | Recent messages — the agent-facing read; `--transcript` = compact plain-text (≈5× smaller, ideal for AI summarization) |
+| `read <CH> [-l N] [--before ID] [--around ID] [--since 12h\|30d\|YYYY-MM-DD] [--transcript]` | Recent messages — the agent-facing read; `--around` = window centered on a message (limit/2 each side); `--since` = time cutoff (snowflake `after` cursor); `--transcript` = compact plain-text (≈5× smaller, ideal for AI summarization) |
 | `members <GUILD> [--max N]` | Guild members |
 | `info <GUILD>` | Guild name, member/online counts |
 | `guild-search <GUILD> <QUERY>` | Discord native search |
 | `roles <GUILD>` | Guild roles, by position |
 | `profile [USER_ID]` | User profile (default: self) |
+| `userinfo <USER_ID>` | Public info for any user (username, badges, avatar, created_at) — user-token safe |
 | `relationships` | Friends / blocked / pending |
 | `threads <CH>` | Active threads (user-token fallback) |
 | `thread-create <CH> --name X [--message-id M] [--text T]` | Create thread (standalone/message/forum) |
@@ -205,7 +210,7 @@ discord watch --keyword "incident" --jsonl
 
 | Command | What it does |
 |---------|--------------|
-| `send <CH> --text "..." [--file PATH]... [--reply ID] [--confirm]` | Send / reply / attach (gated; `--text -` reads stdin) |
+| `send <CH> --text "..." [--file PATH]... [--reply ID] [--suppress-embeds] [--mention-roles ID]... [--confirm]` | Send / reply / attach (gated; `--text -` reads stdin; `--suppress-embeds` kills link previews; `--mention-roles` allowlists role mentions) |
 | `edit <CH> <MSG_ID> --text "..."` | Edit own message |
 | `delete <CH> <MSG_ID> [--confirm]` | Delete own message (gated) |
 | `react` / `unreact` | Add / remove a reaction |
@@ -259,11 +264,13 @@ Admin ops map 403 → **exit 4**. Full permission matrix + risk table: [docs/ADM
 
 | Command | What it does |
 |---------|--------------|
-| `sync <CH> [-l N]` | Incremental two-phase sync to SQLite |
+| `sync <CH> [-l N] [--follow [--max-duration S]]` | Incremental two-phase sync to SQLite; `--follow` keeps tailing new messages into the archive via gateway (invisible presence) |
 | `sync-all [-l N]` | Discover + sync accessible channels (bounded) |
-| `search <KW> [-c CH] [-n N]` | FTS5 full-text search |
-| `recent [--hours N]` | Newest stored messages |
+| `search <KW> [-c CH] [--author A] [--since 12h\|30d\|DATE] [-n N]` | FTS5 full-text search |
+| `recent [--hours N] [--since 12h\|30d\|DATE]` | Newest stored messages |
 | `stats` | Per-channel counts |
+| `today` | Per-channel counts since 00:00 local |
+| `timeline [--by day\|hour]` | Message volume per bucket (ASCII bars) |
 | `top [-c CH]` | Top senders |
 | `top-reactions [--guild G] [--channel C] [--limit N]` | Hottest messages by reaction count |
 | `export <CH> [-f json] [-o FILE]` | Export archive |
@@ -277,6 +284,7 @@ Admin ops map 403 → **exit 4**. Full permission matrix + risk table: [docs/ADM
 | `typing <CH>` | Send a typing indicator (one-shot) |
 | `tail <CH> [--once]` / `watch [--typing]` | Gateway live follow (invisible presence) |
 | `watch [--channel C] [--keyword K]` | Long-running JSONL stream for agents |
+| `fetch-links <CH> [--since S] [--limit N] [--out DIR]` | Download external image links via Discord CDN proxy |
 | `serve` | MCP server (stdio, 43 tools) |
 
 ---
@@ -289,7 +297,7 @@ crates/
                   config, types, output envelope
   discord-auth/   token auto-detect (LevelDB scan), paste, keyring, device_id
   discord-db/     SQLite schema, FTS5 search, two-phase sync state
-  discord-cli/    the `discord` binary + 75 commands
+  discord-cli/    the `discord` binary + 77 commands
   discord-mcp/    MCP server (rmcp stdio) — 43 tools
 ```
 

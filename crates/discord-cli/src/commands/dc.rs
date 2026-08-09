@@ -53,6 +53,9 @@ pub enum DcCmd {
         /// Fetch messages before this snowflake.
         #[arg(long)]
         before: Option<u64>,
+        /// Fetch messages around this message ID (limit/2 each side).
+        #[arg(long, conflicts_with = "before")]
+        around: Option<u64>,
     },
     /// List guild members.
     Members {
@@ -119,6 +122,12 @@ pub enum DcCmd {
         /// Preview what would be sent without sending.
         #[arg(long)]
         dry_run: bool,
+        /// Suppress link embeds in this message (SUPPRESS_EMBEDS flag).
+        #[arg(long)]
+        suppress_embeds: bool,
+        /// Allow mentioning this role id (repeatable; @everyone/@here stay off).
+        #[arg(long)]
+        mention_roles: Vec<String>,
     },
     /// Send a typing indicator to a channel (one-shot).
     Typing {
@@ -483,11 +492,17 @@ pub async fn dc_history(
 }
 
 /// `dc read <CHANNEL>` — recent messages (default 50), AI-facing.
+///
+/// `--around <ID>` fetches `limit/2` messages before the snowflake and
+/// `limit/2` after, then merges + sorts ascending — a window centered on a
+/// message (exclusive of the anchor itself).
 pub async fn dc_read(
     ctx: &DcCtx,
     channel: &str,
     limit: usize,
     before: Option<u64>,
+    since: Option<&str>,
+    around: Option<u64>,
     transcript: bool,
 ) -> ExitCode {
     let mut client = match ctx.client().await {
@@ -499,26 +514,95 @@ pub async fn dc_read(
         Err(code) => return code,
     };
 
-    match client
-        .fetch_messages(&channel_id, limit, before, None)
-        .await
-    {
-        Ok(msgs) => {
-            if transcript {
-                // Compact plain-text transcript: `[HH:MM:SS] author: content`.
-                // ~5x smaller than JSON — the AI-summarization cronjob format.
-                for m in &msgs {
-                    let ts = m.timestamp.get(11..19).unwrap_or(&m.timestamp);
-                    let content = m.content.replace('\n', " ⏎ ");
-                    println!("[{ts}] {}: {content}", m.author);
-                }
-                ExitCode::from(exit::OK)
-            } else {
-                let _ = output::emit(&msgs, ctx.format);
-                ExitCode::from(exit::OK)
+    // --since becomes an `after` snowflake cursor, bounding the window
+    // together with --before (both allowed). Invalid values are a usage error.
+    let after = match since {
+        Some(s) => match crate::commands::download::parse_since(s) {
+            Some(t) => Some(crate::commands::download::time_to_snowflake(t)),
+            None => {
+                eprintln!("invalid --since: \"{s}\" (use YYYY-MM-DD or 12h/30d/6m/1y)");
+                return ExitCode::from(exit::USAGE);
             }
+        },
+        None => None,
+    };
+
+    // --around is mutually exclusive with --before (enforced by clap
+    // conflicts_with_all); fetch limit/2 each side of the anchor and merge.
+    // --since's `after` cursor composes as the lower bound of the before side.
+    match around {
+        Some(anchor) => {
+            let (n_before, n_after) = split_around_limit(limit);
+            let mut msgs = Vec::new();
+            // Messages strictly older than the anchor (`before` cursor).
+            match client
+                .fetch_messages(&channel_id, n_before, Some(anchor), after)
+                .await
+            {
+                Ok(before_msgs) => msgs.extend(before_msgs),
+                Err(e) => {
+                    return ExitCode::from(output::emit_error(
+                        "ApiError",
+                        &e.to_string(),
+                        classify(&e),
+                    ))
+                }
+            }
+            // Messages strictly newer than the anchor (`after` cursor).
+            match client
+                .fetch_messages(&channel_id, n_after, None, Some(anchor).or(after))
+                .await
+            {
+                Ok(after_msgs) => msgs.extend(after_msgs),
+                Err(e) => {
+                    return ExitCode::from(output::emit_error(
+                        "ApiError",
+                        &e.to_string(),
+                        classify(&e),
+                    ))
+                }
+            }
+            // Both fetches return ascending — a plain merge sort by id
+            // (fetch_messages already sorts each batch; re-sort defensively).
+            msgs.sort_by_key(|m| m.message_id.clone());
+            emit_read(&msgs, ctx.format, transcript)
         }
-        Err(e) => ExitCode::from(output::emit_error("ApiError", &e.to_string(), classify(&e))),
+        None => match client
+            .fetch_messages(&channel_id, limit, before, after)
+            .await
+        {
+            Ok(msgs) => emit_read(&msgs, ctx.format, transcript),
+            Err(e) => ExitCode::from(output::emit_error("ApiError", &e.to_string(), classify(&e))),
+        },
+    }
+}
+
+/// Split a fetch limit into (before, after) halves for `--around`.
+///
+/// Odd limits give the extra message to the *before* side (the anchor's
+/// history is usually the interesting part): `5 → (3, 2)`.
+fn split_around_limit(limit: usize) -> (usize, usize) {
+    (limit / 2 + limit % 2, limit / 2)
+}
+
+/// Emit fetched messages in the requested format (JSON / transcript).
+fn emit_read(
+    msgs: &Vec<discord_core::types::Message>,
+    format: Format,
+    transcript: bool,
+) -> ExitCode {
+    if transcript {
+        // Compact plain-text transcript: `[HH:MM:SS] author: content`.
+        // ~5x smaller than JSON — the AI-summarization cronjob format.
+        for m in msgs {
+            let ts = m.timestamp.get(11..19).unwrap_or(&m.timestamp);
+            let content = m.content.replace('\n', " ⏎ ");
+            println!("[{ts}] {}: {content}", m.author);
+        }
+        ExitCode::from(exit::OK)
+    } else {
+        let _ = output::emit(msgs, format);
+        ExitCode::from(exit::OK)
     }
 }
 
@@ -638,6 +722,25 @@ pub async fn dc_profile(ctx: &DcCtx, user_id: Option<&str>) -> ExitCode {
     match client.user_profile(&uid).await {
         Ok(profile) => {
             let _ = output::emit(&profile, ctx.format);
+            ExitCode::from(exit::OK)
+        }
+        Err(e) => ExitCode::from(output::emit_error("ApiError", &e.to_string(), classify(&e))),
+    }
+}
+
+/// `dc userinfo <USER_ID>` — public info for ANY user via `GET /users/{id}`.
+///
+/// Works for user tokens (unlike `GET /guilds/{id}/members/{uid}`, which is
+/// bot-only): username, global name, discriminator, avatar/banner, badges,
+/// premium, account age. Requires a numeric snowflake.
+pub async fn dc_userinfo(ctx: &DcCtx, user_id: &str) -> ExitCode {
+    let mut client = match ctx.client().await {
+        Ok(c) => c,
+        Err(code) => return code,
+    };
+    match client.user_info(user_id).await {
+        Ok(info) => {
+            let _ = output::emit(&info, ctx.format);
             ExitCode::from(exit::OK)
         }
         Err(e) => ExitCode::from(output::emit_error("ApiError", &e.to_string(), classify(&e))),
@@ -834,6 +937,10 @@ pub struct SendOpts<'a> {
     pub typing: bool,
     pub confirm: bool,
     pub dry_run: bool,
+    /// SUPPRESS_EMBEDS message flag (bead v73).
+    pub suppress_embeds: bool,
+    /// Role ids whose mention the message may use (repeatable flag).
+    pub mention_roles: Vec<String>,
 }
 
 pub async fn dc_send(ctx: &DcCtx, channel: &str, opts: SendOpts<'_>) -> ExitCode {
@@ -844,6 +951,8 @@ pub async fn dc_send(ctx: &DcCtx, channel: &str, opts: SendOpts<'_>) -> ExitCode
         typing,
         confirm,
         dry_run,
+        suppress_embeds,
+        mention_roles,
     } = opts;
     // Require text or at least one file.
     if text.is_none() && files.is_empty() {
@@ -857,6 +966,8 @@ pub async fn dc_send(ctx: &DcCtx, channel: &str, opts: SendOpts<'_>) -> ExitCode
         );
         return ExitCode::from(exit::USAGE);
     }
+    // Discord message flags bitfield; SUPPRESS_EMBEDS = 4.
+    let flags = if suppress_embeds { 4 } else { 0 };
     if dry_run {
         let data = serde_json::json!({
             "action": "send_message",
@@ -864,6 +975,12 @@ pub async fn dc_send(ctx: &DcCtx, channel: &str, opts: SendOpts<'_>) -> ExitCode
             "text": text,
             "files": files,
             "reply_to": reply,
+            "flags": flags,
+            "allowed_mentions": if mention_roles.is_empty() {
+                serde_json::Value::Null
+            } else {
+                serde_json::json!({ "parse": [], "roles": mention_roles })
+            },
         });
         let _ = output::emit(&data, ctx.format);
         return ExitCode::from(exit::OK);
@@ -900,10 +1017,19 @@ pub async fn dc_send(ctx: &DcCtx, channel: &str, opts: SendOpts<'_>) -> ExitCode
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
     let result = if attachments.is_empty() {
-        client.send_message(&channel_id, &text, reply).await
+        client
+            .send_message(&channel_id, &text, reply, flags, &mention_roles)
+            .await
     } else {
         client
-            .send_message_with_files(&channel_id, &text, reply, attachments)
+            .send_message_with_files(
+                &channel_id,
+                &text,
+                reply,
+                attachments,
+                flags,
+                &mention_roles,
+            )
             .await
     };
     match result {
@@ -1324,7 +1450,8 @@ pub async fn dispatch(ctx: &DcCtx, cmd: DcCmd) -> ExitCode {
             channel,
             limit,
             before,
-        } => dc_read(ctx, &channel, limit, before, false).await,
+            around,
+        } => dc_read(ctx, &channel, limit, before, None, around, false).await,
         DcCmd::Members { guild, max } => dc_members(ctx, &guild, max).await,
         DcCmd::Info { guild } => dc_info(ctx, &guild).await,
         DcCmd::Search {
@@ -1345,6 +1472,8 @@ pub async fn dispatch(ctx: &DcCtx, cmd: DcCmd) -> ExitCode {
             typing,
             confirm,
             dry_run,
+            suppress_embeds,
+            mention_roles,
         } => {
             dc_send(
                 ctx,
@@ -1356,6 +1485,8 @@ pub async fn dispatch(ctx: &DcCtx, cmd: DcCmd) -> ExitCode {
                     typing,
                     confirm,
                     dry_run,
+                    suppress_embeds,
+                    mention_roles,
                 },
             )
             .await

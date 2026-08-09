@@ -70,3 +70,18 @@ pub struct ExportRow {
     pub content: String,
     pub timestamp: String,
 }
+
+/// Per-channel message count for today (today command).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TodayStat {
+    pub channel_name: String,
+    pub guild_name: String,
+    pub message_count: i64,
+}
+
+/// One timeline bucket (day `YYYY-MM-DD` or hour `HH:00`).
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct TimelineBucket {
+    pub bucket: String,
+    pub count: i64,
+}

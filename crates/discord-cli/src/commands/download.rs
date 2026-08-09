@@ -13,19 +13,20 @@ use discord_db::db as ddb;
 use super::dc::DcCtx;
 
 /// Discord epoch (ms) — snowflake timestamp base (langkurt timeutil.go:49).
-#[allow(dead_code)] // used by time_to_snowflake (--since filter)
 const DISCORD_EPOCH_MS: i64 = 1_420_070_400_000;
 
-/// Parse a `--since` value: exact date `YYYY-MM-DD` or `<n><d|m|y>`.
+/// Parse a `--since` value: exact date `YYYY-MM-DD` or `<n><d|m|y|h>`.
 /// Returns a UTC DateTime (langkurt ParseSince timeutil.go:13-43).
-fn parse_since(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+/// Shared with `dc read --since` (dc.rs), which converts the cutoff to a
+/// snowflake `after` cursor.
+pub(crate) fn parse_since(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
     // Exact date.
     if let Ok(d) = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d") {
         return d
             .and_hms_opt(0, 0, 0)
             .map(|t| chrono::DateTime::from_naive_utc_and_offset(t, chrono::Utc));
     }
-    // <n><d|m|y> relative.
+    // <n><d|m|y|h> relative.
     let (num, unit) = s.split_at(s.len().saturating_sub(1));
     let n: i64 = num.parse().ok()?;
     if n <= 0 {
@@ -33,6 +34,7 @@ fn parse_since(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
     }
     let now = chrono::Utc::now();
     match unit {
+        "h" => Some(now - chrono::Duration::hours(n)),
         "d" => Some(now - chrono::Duration::days(n)),
         "m" => Some(now - chrono::Duration::days(30 * n)),
         "y" => Some(now - chrono::Duration::days(365 * n)),
@@ -40,18 +42,29 @@ fn parse_since(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
     }
 }
 
+/// `--since` cutoff formatted for RFC3339 string comparison against stored
+/// timestamps. The archive stores UTC `Z` strings (e.g. `...T14:23:05.123Z`),
+/// so a naive UTC form (no `+00:00` suffix) compares lexically — `to_rfc3339()`
+/// would emit `+00:00`, where `'Z' > '+'` corrupts the ordering at the
+/// first differing char.
+pub(crate) fn since_cutoff(s: &str) -> Option<String> {
+    parse_since(s).map(|t| t.format("%Y-%m-%dT%H:%M:%S").to_string())
+}
+
 /// Convert a DateTime to a snowflake cutoff (langkurt TimeToSnowflake:49-57).
-/// `(ms - epoch) << 22`, clamped at 0 for pre-epoch dates.
-#[allow(dead_code)] // reserved for --since snowflake cutoff (tests cover math)
-fn time_to_snowflake(t: chrono::DateTime<chrono::Utc>) -> String {
+/// `(ms - epoch) << 22`, clamped at 0 for pre-epoch dates. Returns u64 to
+/// slot directly into the `after` cursor of fetch_messages.
+/// Shared with `fetch-links` (--since REST `after` cursor).
+pub(crate) fn time_to_snowflake(t: chrono::DateTime<chrono::Utc>) -> u64 {
     let ms = t.timestamp_millis();
     let shifted = (ms - DISCORD_EPOCH_MS).max(0) << 22;
-    shifted.to_string()
+    shifted as u64
 }
 
 /// Sanitise a name for use as a directory segment (langkurt
 /// sanitiseName download.go:123-134).
-fn sanitise_name(name: &str) -> String {
+/// Shared with `fetch-links` (output subdirs + filenames).
+pub(crate) fn sanitise_name(name: &str) -> String {
     name.chars()
         .map(|c| match c {
             '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
@@ -132,10 +145,10 @@ pub async fn dc_download(ctx: &DcCtx, opts: DownloadOpts<'_>) -> ExitCode {
         ..Default::default()
     };
     if let Some(s) = since {
-        match parse_since(s) {
-            Some(t) => filter.since = Some(t.to_rfc3339()),
+        match since_cutoff(s) {
+            Some(cutoff) => filter.since = Some(cutoff),
             None => {
-                eprintln!("invalid --since: \"{s}\" (use YYYY-MM-DD or 30d/6m/1y)");
+                eprintln!("invalid --since: \"{s}\" (use YYYY-MM-DD or 30d/6m/1y/12h)");
                 return ExitCode::from(exit::USAGE);
             }
         }
@@ -258,8 +271,20 @@ mod tests {
         assert!(parse_since("30d").is_some());
         assert!(parse_since("6m").is_some());
         assert!(parse_since("1y").is_some());
+        assert!(parse_since("12h").is_some());
+        assert!(parse_since("1h").is_some());
         assert!(parse_since("0d").is_none());
+        assert!(parse_since("0h").is_none());
         assert!(parse_since("bogus").is_none());
+        assert!(parse_since("2w").is_none());
+    }
+
+    #[test]
+    fn parse_since_hours_approx_one_hour_back() {
+        let before = chrono::Utc::now() - chrono::Duration::hours(1);
+        let after = chrono::Utc::now() - chrono::Duration::hours(1) + chrono::Duration::minutes(5);
+        let t = parse_since("1h").unwrap();
+        assert!(t >= before && t <= after, "1h cutoff out of range: {t}");
     }
 
     #[test]
@@ -268,16 +293,11 @@ mod tests {
             chrono::DateTime::parse_from_rfc3339(s).unwrap().into()
         }
         // 2015-01-01 = epoch -> 0.
-        assert_eq!(time_to_snowflake(utc("2015-01-01T00:00:00Z")), "0");
+        assert_eq!(time_to_snowflake(utc("2015-01-01T00:00:00Z")), 0);
         // 2016-01-01 = epoch + 1y -> (1y ms) << 22 > 0.
-        assert!(
-            time_to_snowflake(utc("2016-01-01T00:00:00Z"))
-                .parse::<i64>()
-                .unwrap()
-                > 0
-        );
+        assert!(time_to_snowflake(utc("2016-01-01T00:00:00Z")) > 0);
         // Pre-epoch clamps to 0.
-        assert_eq!(time_to_snowflake(utc("2014-01-01T00:00:00Z")), "0");
+        assert_eq!(time_to_snowflake(utc("2014-01-01T00:00:00Z")), 0);
     }
 
     #[test]

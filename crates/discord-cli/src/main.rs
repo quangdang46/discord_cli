@@ -91,6 +91,12 @@ enum Command {
         /// Fetch messages before this snowflake.
         #[arg(long)]
         before: Option<u64>,
+        /// Fetch messages around this message ID (limit/2 each side).
+        #[arg(long, conflicts_with_all = ["before"])]
+        around: Option<u64>,
+        /// Only messages on/after this time (12h|30d|YYYY-MM-DD).
+        #[arg(long)]
+        since: Option<String>,
         /// Compact plain-text transcript `[HH:MM:SS] author: content`
         /// — ~5x smaller than JSON, ideal for AI summarization.
         #[arg(long)]
@@ -132,6 +138,11 @@ enum Command {
         /// User ID (default: current user).
         user_id: Option<String>,
     },
+    /// Public info for any user (username, badges, avatar, created_at).
+    Userinfo {
+        /// User ID.
+        user_id: String,
+    },
     /// Show friends/blocked/pending relationships.
     Relationships,
     /// List active threads in a channel (user-token fallback).
@@ -161,6 +172,12 @@ enum Command {
         /// Preview what would be sent without sending.
         #[arg(long)]
         dry_run: bool,
+        /// Suppress link embeds in this message (SUPPRESS_EMBEDS flag).
+        #[arg(long)]
+        suppress_embeds: bool,
+        /// Allow mentioning this role id (repeatable; @everyone/@here stay off).
+        #[arg(long)]
+        mention_roles: Vec<String>,
     },
     /// Send a typing indicator to a channel (one-shot).
     Typing {
@@ -221,6 +238,20 @@ enum Command {
         #[arg(long)]
         limit: Option<i64>,
         /// Output directory (default <data_dir>/media).
+        #[arg(long)]
+        out: Option<String>,
+    },
+    /// Download images linked in messages via the Discord CDN proxy.
+    FetchLinks {
+        /// Channel name or ID.
+        channel: String,
+        /// Only links from messages on/after this date (30d|6m|1y|YYYY-MM-DD).
+        #[arg(long)]
+        since: Option<String>,
+        /// Max messages to scan (default 100).
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+        /// Output directory (default <data_dir>/media-links).
         #[arg(long)]
         out: Option<String>,
     },
@@ -301,6 +332,13 @@ enum Command {
         /// Max messages (default 5000).
         #[arg(short, long, default_value_t = 5000)]
         limit: usize,
+        /// After backfill, keep tailing new messages into SQLite via the
+        /// gateway (invisible presence) until Ctrl-C.
+        #[arg(long)]
+        follow: bool,
+        /// With --follow: exit gracefully after this many seconds.
+        #[arg(long)]
+        max_duration: Option<u64>,
     },
     /// Discover and sync all accessible text channels (bounded).
     SyncAll {
@@ -345,6 +383,12 @@ enum Command {
         /// Filter by channel name.
         #[arg(short, long)]
         channel: Option<String>,
+        /// Author name contains.
+        #[arg(long)]
+        author: Option<String>,
+        /// Only messages on/after (12h|30d|YYYY-MM-DD).
+        #[arg(long)]
+        since: Option<String>,
         /// Max results (default 50).
         #[arg(short, long, default_value_t = 50)]
         limit: usize,
@@ -357,12 +401,23 @@ enum Command {
         /// Only messages from the last N hours.
         #[arg(long)]
         hours: Option<i64>,
+        /// Only messages on/after (12h|30d|YYYY-MM-DD).
+        #[arg(long)]
+        since: Option<String>,
         /// Max results (default 50).
         #[arg(short, long, default_value_t = 50)]
         limit: usize,
     },
     /// Per-channel message counts.
     Stats,
+    /// Per-channel message counts since 00:00 local time.
+    Today,
+    /// Message volume per day or per hour (ASCII bars on TTY).
+    Timeline {
+        /// Granularity: day|hour (default hour).
+        #[arg(long, default_value = "hour")]
+        by: String,
+    },
     /// Top senders.
     Top {
         /// Filter by channel name.
@@ -883,8 +938,21 @@ async fn run() -> ExitCode {
             channel,
             limit,
             before,
+            around,
+            since,
             transcript,
-        }) => commands::dc::dc_read(ctx, &channel, limit, before, transcript).await,
+        }) => {
+            commands::dc::dc_read(
+                ctx,
+                &channel,
+                limit,
+                before,
+                since.as_deref(),
+                around,
+                transcript,
+            )
+            .await
+        }
         Some(Command::Members { guild, max }) => commands::dc::dc_members(ctx, &guild, max).await,
         Some(Command::Info { guild }) => commands::dc::dc_info(ctx, &guild).await,
         Some(Command::GuildSearch {
@@ -897,6 +965,7 @@ async fn run() -> ExitCode {
         Some(Command::Profile { user_id }) => {
             commands::dc::dc_profile(ctx, user_id.as_deref()).await
         }
+        Some(Command::Userinfo { user_id }) => commands::dc::dc_userinfo(ctx, &user_id).await,
         Some(Command::Relationships) => commands::dc::dc_relationships(ctx).await,
         Some(Command::Threads { channel }) => commands::dc::dc_threads(ctx, &channel).await,
         Some(Command::Send {
@@ -907,6 +976,8 @@ async fn run() -> ExitCode {
             typing,
             confirm,
             dry_run,
+            suppress_embeds,
+            mention_roles,
         }) => {
             commands::dc::dc_send(
                 ctx,
@@ -918,6 +989,8 @@ async fn run() -> ExitCode {
                     typing,
                     confirm,
                     dry_run,
+                    suppress_embeds,
+                    mention_roles,
                 },
             )
             .await
@@ -968,6 +1041,23 @@ async fn run() -> ExitCode {
             )
             .await
         }
+        Some(Command::FetchLinks {
+            channel,
+            since,
+            limit,
+            out,
+        }) => {
+            commands::fetchlinks::cmd_fetch_links(
+                ctx,
+                commands::fetchlinks::FetchLinksOpts {
+                    channel: &channel,
+                    since: since.as_deref(),
+                    limit,
+                    out: out.as_deref(),
+                },
+            )
+            .await
+        }
         Some(Command::ThreadCreate {
             channel,
             name,
@@ -1012,7 +1102,18 @@ async fn run() -> ExitCode {
             message_id,
         }) => commands::dc::dc_pin(ctx, &channel, &message_id).await,
         Some(Command::Pins { channel }) => commands::dc::dc_pins(ctx, &channel).await,
-        Some(Command::Sync { channel, limit }) => commands::dc::dc_sync(ctx, &channel, limit).await,
+        Some(Command::Sync {
+            channel,
+            limit,
+            follow,
+            max_duration,
+        }) => {
+            if follow {
+                commands::sync::dc_sync_follow(ctx, &channel, limit, max_duration).await
+            } else {
+                commands::dc::dc_sync(ctx, &channel, limit).await
+            }
+        }
         Some(Command::SyncAll { limit }) => commands::dc::dc_sync_all(ctx, limit).await,
         Some(Command::Tail { channel, once }) => commands::tail::dc_tail(ctx, &channel, once).await,
         Some(Command::Watch {
@@ -1025,14 +1126,28 @@ async fn run() -> ExitCode {
         Some(Command::Search {
             keyword,
             channel,
+            author,
+            since,
             limit,
-        }) => commands::local::cmd_search(&keyword, channel.as_deref(), limit, format),
+        }) => commands::local::cmd_search(
+            &keyword,
+            channel.as_deref(),
+            author.as_deref(),
+            since.as_deref(),
+            limit,
+            format,
+        ),
         Some(Command::Recent {
             channel,
             hours,
+            since,
             limit,
-        }) => commands::local::cmd_recent(channel.as_deref(), hours, limit, format),
+        }) => {
+            commands::local::cmd_recent(channel.as_deref(), hours, since.as_deref(), limit, format)
+        }
         Some(Command::Stats) => commands::local::cmd_stats(format),
+        Some(Command::Today) => commands::local::cmd_today(format),
+        Some(Command::Timeline { by }) => commands::local::cmd_timeline(&by, format),
         Some(Command::Top { channel, limit }) => {
             commands::local::cmd_top(channel.as_deref(), limit, format)
         }

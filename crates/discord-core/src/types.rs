@@ -274,6 +274,44 @@ pub struct UserProfile {
     pub bio: Option<String>,
 }
 
+/// A user's public info (`GET /users/{id}`).
+///
+/// Everything here comes from the public user object — no member-only fields
+/// (nickname, roles, guild presence), which would require the bot-only
+/// `GET /guilds/{id}/members/{uid}` and 403 for user tokens. `created_at` is
+/// derived from the snowflake's embedded timestamp, `avatar_url`/`banner_url`
+/// are built CDN links when a hash exists.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UserInfo {
+    pub user_id: String,
+    pub username: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub discriminator: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub global_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub avatar: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub avatar_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub banner: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub banner_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub accent_color: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bot: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mfa_enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub premium_type: Option<u8>,
+    /// Public flags bitfield (STAFF/PARTNER/HYPESQUAD/... badges).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub public_flags: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<String>,
+}
+
 /// A DM or group-DM channel.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DmChannel {
