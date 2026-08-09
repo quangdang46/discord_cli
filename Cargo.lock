@@ -480,7 +480,7 @@ dependencies = [
 
 [[package]]
 name = "discord-auth"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -507,7 +507,7 @@ dependencies = [
 
 [[package]]
 name = "discord-cli"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "chrono",
@@ -530,7 +530,7 @@ dependencies = [
 
 [[package]]
 name = "discord-core"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -553,7 +553,7 @@ dependencies = [
 
 [[package]]
 name = "discord-db"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "chrono",
@@ -567,7 +567,7 @@ dependencies = [
 
 [[package]]
 name = "discord-mcp"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "chrono",
