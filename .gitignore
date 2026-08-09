@@ -21,3 +21,5 @@ Thumbs.db
 .idea/
 .vscode/
 *.swp
+# Claude Code workflow worktrees (embedded repos)
+.claude/worktrees/
