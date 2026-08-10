@@ -89,8 +89,12 @@ try {
             Invoke-WebRequest -Uri $url -OutFile $zipPath -TimeoutSec 120
             # Checksum - the release publishes GNU sha256sum format, which may
             # be prefixed with a '*' (binary mode), e.g. "<hash> *discord-...".
+            # NOTE: GitHub serves release assets as octet-stream, so
+            # Invoke-WebRequest .Content is a byte[] on Windows PowerShell,
+            # not a string - decode it explicitly.
             try {
-                $raw = (Invoke-WebRequest -Uri "$url.sha256" -TimeoutSec 30).Content
+                $raw = [System.Text.Encoding]::ASCII.GetString(
+                    (Invoke-WebRequest -Uri "$url.sha256" -TimeoutSec 30).Content)
                 $sum = ($raw.Trim() -split "\s+")[0].TrimStart("*").ToLower()
                 $actual = (Get-FileHash $zipPath -Algorithm SHA256).Hash.ToLower()
                 if ($sum -ne $actual) { Die "Checksum mismatch" }
