@@ -159,7 +159,8 @@ main() {
     if [ "$FROM_SOURCE" -eq 0 ]; then
         resolve_version
         local ext="tar.gz"; [[ "$platform" == windows-* ]] && ext="zip"
-        local archive="${BINARY_NAME}-${VERSION}-${platform}.${ext}"
+        # Release assets are named discord-{platform}.zip|tar.gz (no version tag).
+        local archive="${BINARY_NAME}-${platform}.${ext}"
         local url="https://github.com/${OWNER}/${REPO}/releases/download/${VERSION}/${archive}"
 
         if download_file "$url" "$TMP/$archive"; then

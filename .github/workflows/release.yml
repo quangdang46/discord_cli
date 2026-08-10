@@ -71,6 +71,9 @@ jobs:
             (cd dist && 7z a -tzip "${PKG}.zip" "${PKG}")
           fi
           sha256sum "dist/${PKG}.${ext}" > "dist/${PKG}.${ext}.sha256"
+          # Keep only archive + checksum in dist so the unpacked binary
+          # (and the release asset upload glob below) doesn't leak stray files.
+          rm -rf "dist/${PKG}"
         env:
           ext: ${{ matrix.ext }}
       - uses: actions/upload-artifact@v4
