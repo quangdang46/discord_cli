@@ -14,6 +14,14 @@
 
 </div>
 
+---
+
+> 🚧 **Active development — daily tested, not daily committed**
+>
+> This repo is under heavy daily use (automated digests, MCP integrations, agent workflows). If commit activity looks sparse, it's because the tool is *stable for its current feature set* — no open issues, no regressions, no need for churn. New features ship when real workflows surface a gap, not on a schedule. Check [Releases](https://github.com/quangdang46/discord_cli/releases) for the latest binary.
+
+---
+
 **A Discord CLI + MCP server that operates your *user account* — so it sees every server, group, and DM you belong to. No bot invitation required.**  
 Built in Rust for AI agents and terminal-first humans: 77 commands, SQLite archive with FTS5 search, stealth-aware, and an MCP server that plugs straight into Claude Code.
 
