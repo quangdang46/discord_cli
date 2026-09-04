@@ -1,5 +1,9 @@
 # discord — Your Discord, Driven From the Terminal
 
+> 🚧 **Active development — daily tested, not daily committed**
+>
+> This repo is under heavy daily use (automated digests, MCP integrations, agent workflows). If commit activity looks sparse, it's because the tool is *stable for its current feature set* — no open issues, no regressions, no need for churn. New features ship when real workflows surface a gap, not on a schedule. Check [Releases](https://github.com/quangdang46/discord_cli/releases) for the latest binary.
+
 <div align="center">
   <img src="docs/assets/discord_illustration.webp"
        alt="discord — read, send, search, and manage any server/DM you belong to, as yourself"
@@ -13,12 +17,6 @@
 ![License](https://img.shields.io/badge/License-MIT-blue.svg)
 
 </div>
-
----
-
-> 🚧 **Active development — daily tested, not daily committed**
->
-> This repo is under heavy daily use (automated digests, MCP integrations, agent workflows). If commit activity looks sparse, it's because the tool is *stable for its current feature set* — no open issues, no regressions, no need for churn. New features ship when real workflows surface a gap, not on a schedule. Check [Releases](https://github.com/quangdang46/discord_cli/releases) for the latest binary.
 
 ---
 
