@@ -14,12 +14,8 @@ path = "src/main.rs"
 [dependencies]
 tokio.workspace = true
 clap.workspace = true
-serde.workspace = true
 serde_json.workspace = true
-serde_yaml.workspace = true
 anyhow.workspace = true
-thiserror.workspace = true
-tracing.workspace = true
 chrono.workspace = true
 discord-core = { path = "../discord-core" }
 discord-auth = { path = "../discord-auth" }

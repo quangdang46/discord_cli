@@ -1077,8 +1077,11 @@ impl ApiClient {
     /// is BOT-ONLY → 403 for user tokens. Fallback to what Discord's own app
     /// uses: `GET /channels/{id}/threads/search` (offset-paginated).
     pub async fn list_threads(&mut self, channel_id: &str) -> Result<Vec<Channel>> {
-        // Try the bot-only active endpoint first; on 403 fall back.
-        let cid: u64 = channel_id.parse().context("invalid channel id")?;
+        // Try the bot-only active endpoint first; ONLY a permission failure
+        // (403 — user tokens can't use it) falls back to threads/search.
+        // Any other error (401, 404, network) must surface, not be masked
+        // by a second request that would fail differently.
+        channel_id.parse::<u64>().context("invalid channel id")?;
         let inner = self.inner()?;
         let threads_url = format!("channels/{}/threads/active", channel_id);
         let bot_only: std::result::Result<ThreadActiveResponse, _> =
@@ -1089,7 +1092,10 @@ impl ApiClient {
                 .into_iter()
                 .map(raw_thread_to_channel)
                 .collect()),
-            Err(_) => {
+            Err(e) => {
+                if !matches!(e, discord_user::DiscordError::PermissionDenied { .. }) {
+                    return Err(e).context("GET threads/active failed");
+                }
                 // 403 → user-token fallback: threads/search, offset-paginated.
                 let mut out = Vec::new();
                 let mut offset: u64 = 0;
@@ -1111,7 +1117,6 @@ impl ApiClient {
                     // rate-limit friendly pause (langkurt sleeps 300ms)
                     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
                 }
-                let _ = cid;
                 Ok(out)
             }
         }

@@ -33,22 +33,12 @@ pub enum OutputFormat {
     Rich,
 }
 
-/// Load `./.env` from cwd first, then fall back to the repo checkout root.
+/// Load `./.env`. `dotenvy::dotenv()` already walks parent directories, so
+/// running inside the repo checkout finds the root `.env` too. (The old
+/// `repo_root()` fallback read `CARGO_MANIFEST_DIR`, which is unset at
+/// runtime — dead code.)
 pub fn load_env() {
     let _ = dotenvy::dotenv();
-    for candidate in [PathBuf::from(".env"), repo_root().join(".env")] {
-        if candidate.is_file() {
-            let _ = dotenvy::from_path(&candidate);
-            return;
-        }
-    }
-}
-
-/// Absolute path of the workspace root (dir containing Cargo.toml), if known.
-pub fn repo_root() -> PathBuf {
-    env::var("CARGO_MANIFEST_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("."))
 }
 
 /// Platform-appropriate base directory for application data

@@ -486,22 +486,16 @@ dependencies = [
  "base64 0.22.1",
  "dirs",
  "discord-core",
- "dotenvy",
  "futures-util",
  "qrcode",
  "rand 0.8.7",
  "regex",
  "reqwest",
  "rsa",
- "rustls",
- "serde",
  "serde_json",
  "sha2",
- "thiserror 2.0.19",
  "tokio",
  "tokio-tungstenite 0.24.0",
- "tracing",
- "uuid",
  "windows",
 ]
 
@@ -520,12 +514,8 @@ dependencies = [
  "md-5",
  "mime_guess",
  "reqwest",
- "serde",
  "serde_json",
- "serde_yaml",
- "thiserror 2.0.19",
  "tokio",
- "tracing",
 ]
 
 [[package]]
@@ -535,7 +525,6 @@ dependencies = [
  "anyhow",
  "base64 0.22.1",
  "chrono",
- "dirs",
  "discord-user-rs",
  "dotenvy",
  "keyring",
@@ -544,9 +533,7 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "shellexpand",
- "thiserror 2.0.19",
  "tokio",
- "tracing",
  "uuid",
  "windows",
 ]
@@ -556,13 +543,8 @@ name = "discord-db"
 version = "0.1.2"
 dependencies = [
  "anyhow",
- "chrono",
- "dirs",
- "discord-core",
  "rusqlite",
  "serde",
- "serde_json",
- "thiserror 2.0.19",
 ]
 
 [[package]]
@@ -571,7 +553,6 @@ version = "0.1.2"
 dependencies = [
  "anyhow",
  "chrono",
- "clap",
  "discord-core",
  "discord-db",
  "discord-user-rs",
@@ -580,9 +561,7 @@ dependencies = [
  "schemars",
  "serde",
  "serde_json",
- "thiserror 2.0.19",
  "tokio",
- "tracing",
 ]
 
 [[package]]

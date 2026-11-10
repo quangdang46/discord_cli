@@ -19,295 +19,6 @@ pub struct DcCtx {
 }
 
 #[derive(Subcommand, Debug)]
-pub enum DcCmd {
-    /// List joined guilds (name/id/icon/owner).
-    Guilds,
-    /// List text/announcement/forum channels of a guild.
-    Channels {
-        /// Guild name or ID.
-        guild: String,
-    },
-    /// List DM + group-DM channels.
-    Dms,
-    /// Fetch message history of a channel (paginated).
-    History {
-        /// Channel name or ID (in the resolved guild).
-        channel: String,
-        /// Max messages to fetch (default 1000, max 1000).
-        #[arg(short, long, default_value_t = 1000)]
-        limit: usize,
-        /// Fetch messages before this snowflake.
-        #[arg(long)]
-        before: Option<u64>,
-        /// Fetch messages after this snowflake.
-        #[arg(long)]
-        after: Option<u64>,
-    },
-    /// Read recent messages (default 50) — the key AI-facing read.
-    Read {
-        /// Channel name or ID.
-        channel: String,
-        /// Max messages (default 50).
-        #[arg(short, long, default_value_t = 50)]
-        limit: usize,
-        /// Fetch messages before this snowflake.
-        #[arg(long)]
-        before: Option<u64>,
-        /// Fetch messages around this message ID (limit/2 each side).
-        #[arg(long, conflicts_with = "before")]
-        around: Option<u64>,
-    },
-    /// List guild members.
-    Members {
-        /// Guild name or ID.
-        guild: String,
-        /// Max members (default 50, max 1000).
-        #[arg(long, default_value_t = 50)]
-        max: u32,
-    },
-    /// Show guild info (name, member counts).
-    Info {
-        /// Guild name or ID.
-        guild: String,
-    },
-    /// Discord native search within a guild.
-    Search {
-        /// Guild name or ID.
-        guild: String,
-        /// Search query.
-        query: String,
-        /// Restrict to a channel name or ID.
-        #[arg(short, long)]
-        channel: Option<String>,
-        /// Max results (default 25).
-        #[arg(short, long, default_value_t = 25)]
-        limit: u32,
-    },
-    /// List guild roles (sorted by position).
-    Roles {
-        /// Guild name or ID.
-        guild: String,
-    },
-    /// Show a user's profile (default: self).
-    Profile {
-        /// User ID (default: current user).
-        user_id: Option<String>,
-    },
-    /// Show friends/blocked/pending relationships.
-    Relationships,
-    /// List active threads in a channel (user-token fallback).
-    Threads {
-        /// Channel name or ID.
-        channel: String,
-    },
-    /// Send a message (requires --confirm unless --reply/--dry-run).
-    Send {
-        /// Channel name or ID.
-        channel: String,
-        /// Message content. "-" reads from stdin.
-        #[arg(long)]
-        text: Option<String>,
-        /// Attach a file (repeatable; max 10 per message).
-        #[arg(long)]
-        file: Vec<String>,
-        /// Reply to a message id.
-        #[arg(long)]
-        reply: Option<String>,
-        /// Send a typing indicator first (mimics a human composing).
-        #[arg(long)]
-        typing: bool,
-        /// Confirm a non-reply send (never interactive).
-        #[arg(long)]
-        confirm: bool,
-        /// Preview what would be sent without sending.
-        #[arg(long)]
-        dry_run: bool,
-        /// Suppress link embeds in this message (SUPPRESS_EMBEDS flag).
-        #[arg(long)]
-        suppress_embeds: bool,
-        /// Allow mentioning this role id (repeatable; @everyone/@here stay off).
-        #[arg(long)]
-        mention_roles: Vec<String>,
-    },
-    /// Send a typing indicator to a channel (one-shot).
-    Typing {
-        /// Channel name or ID.
-        channel: String,
-    },
-    /// Join a server via invite code or URL (requires --confirm).
-    Join {
-        /// Invite code or full URL (discord.gg/..., discord.com/invite/...).
-        invite: String,
-        /// Confirm joining (never interactive).
-        #[arg(long)]
-        confirm: bool,
-    },
-    /// Leave a server (requires --confirm).
-    Leave {
-        /// Guild name or ID.
-        guild: String,
-        /// Confirm leaving (never interactive).
-        #[arg(long)]
-        confirm: bool,
-    },
-    /// Show or set presence (online|idle|dnd|invisible).
-    Presence {
-        /// New status. Omit to show the configured default.
-        status: Option<String>,
-    },
-    /// Create a thread (standalone, from message, or forum post).
-    ThreadCreate {
-        /// Channel name or ID.
-        channel: String,
-        /// Thread name.
-        #[arg(long)]
-        name: String,
-        /// Create from this message ID (text/announcement parent).
-        #[arg(long)]
-        message_id: Option<String>,
-        /// Starter message content (required for forum; optional standalone).
-        #[arg(long)]
-        text: Option<String>,
-        /// Auto-archive minutes (60|1440|4320|10080; default 1440).
-        #[arg(long)]
-        archive: Option<u32>,
-        /// Comma-separated forum tag IDs.
-        #[arg(long)]
-        tags: Option<String>,
-    },
-    /// Edit an own message.
-    Edit {
-        /// Channel name or ID.
-        channel: String,
-        /// Message ID.
-        message_id: String,
-        /// New content.
-        #[arg(long)]
-        text: String,
-    },
-    /// Delete an own message (requires --confirm).
-    Delete {
-        /// Channel name or ID.
-        channel: String,
-        /// Message ID.
-        message_id: String,
-        /// Confirm deletion.
-        #[arg(long)]
-        confirm: bool,
-    },
-    /// Add a reaction.
-    React {
-        /// Channel name or ID.
-        channel: String,
-        /// Message ID.
-        message_id: String,
-        /// Emoji (unicode or :name:).
-        emoji: String,
-    },
-    /// Remove own reaction.
-    Unreact {
-        /// Channel name or ID.
-        channel: String,
-        /// Message ID.
-        message_id: String,
-        /// Emoji.
-        emoji: String,
-    },
-    /// Pin a message.
-    Pin {
-        /// Channel name or ID.
-        channel: String,
-        /// Message ID.
-        message_id: String,
-    },
-    /// List pinned messages.
-    Pins {
-        /// Channel name or ID.
-        channel: String,
-    },
-    /// Incrementally sync a channel's history to SQLite.
-    Sync {
-        /// Channel name or ID.
-        channel: String,
-        /// Max messages (default 5000).
-        #[arg(short, long, default_value_t = 5000)]
-        limit: usize,
-    },
-    /// Discover and sync all accessible text channels (bounded).
-    SyncAll {
-        /// Per-channel cap (default 200).
-        #[arg(short, long, default_value_t = 200)]
-        limit: usize,
-    },
-    /// Follow new messages live (gateway, invisible presence).
-    Tail {
-        /// Channel ID (empty = all channels).
-        channel: String,
-        /// Fetch once and exit after a short listen.
-        #[arg(long)]
-        once: bool,
-    },
-    /// Long-running JSONL stream for agents (optional filters).
-    Watch {
-        /// Only stream this channel ID.
-        #[arg(long)]
-        channel: Option<String>,
-        /// Only stream messages containing this keyword.
-        #[arg(long)]
-        keyword: Option<String>,
-        /// Also emit typing-indicator events as JSONL.
-        #[arg(long)]
-        typing: bool,
-    },
-    /// Top-reacted messages from the archive (hottest first).
-    TopReactions {
-        /// Filter by guild name.
-        #[arg(long)]
-        guild: Option<String>,
-        /// Filter by channel name.
-        #[arg(long)]
-        channel: Option<String>,
-        /// Max results (default 10).
-        #[arg(long)]
-        limit: Option<i64>,
-    },
-    /// Download archived attachments to disk (offline).
-    Download {
-        /// Filter by guild name or ID.
-        #[arg(long)]
-        guild: Option<String>,
-        /// Filter by channel name or ID.
-        #[arg(long)]
-        channel: Option<String>,
-        /// Media type filter (image|gif|video|all).
-        #[arg(long)]
-        r#type: Option<String>,
-        /// Only files from messages on/after this date (30d|6m|1y|YYYY-MM-DD).
-        #[arg(long)]
-        since: Option<String>,
-        /// Only files from messages with at least this many reactions.
-        #[arg(long)]
-        min_reactions: Option<i64>,
-        /// Max files to download (0 = unlimited).
-        #[arg(long)]
-        limit: Option<i64>,
-        /// Output directory (default <data_dir>/media).
-        #[arg(long)]
-        out: Option<String>,
-    },
-    /// Group DM management.
-    DmGroup {
-        #[command(subcommand)]
-        cmd: DmGroupCmd,
-    },
-    /// Notification settings (mute, level).
-    Notify {
-        #[command(subcommand)]
-        cmd: NotifyCmd,
-    },
-}
-
-#[derive(Subcommand, Debug)]
 pub enum DmGroupCmd {
     /// Create a group DM with 2+ recipient user IDs (comma-separated).
     Create {
@@ -606,7 +317,7 @@ fn emit_read(
         for m in msgs {
             let ts = m.timestamp.get(11..19).unwrap_or(&m.timestamp);
             let content = m.content.replace('\n', " ⏎ ");
-            println!("[{ts}] {}: {content}", m.author);
+            output::out_line(&format!("[{ts}] {}: {content}", m.author));
         }
         ExitCode::from(exit::OK)
     } else {
@@ -1536,164 +1247,6 @@ pub async fn dc_sync_all(ctx: &DcCtx, limit: usize) -> ExitCode {
         return ExitCode::from(exit::ERROR);
     }
     ExitCode::from(exit::OK)
-}
-
-/// Dispatch a `dc` subcommand.
-#[allow(dead_code)] // kept for potential reuse; top-level dispatch lives in main.rs
-pub async fn dispatch(ctx: &DcCtx, cmd: DcCmd) -> ExitCode {
-    match cmd {
-        DcCmd::Guilds => dc_guilds(ctx).await,
-        DcCmd::Channels { guild } => dc_channels(ctx, &guild).await,
-        DcCmd::Dms => dc_dms(ctx).await,
-        DcCmd::History {
-            channel,
-            limit,
-            before,
-            after,
-        } => dc_history(ctx, &channel, limit, before, after).await,
-        DcCmd::Read {
-            channel,
-            limit,
-            before,
-            around,
-        } => dc_read(ctx, &channel, limit, before, None, around, false).await,
-        DcCmd::Members { guild, max } => dc_members(ctx, &guild, max).await,
-        DcCmd::Info { guild } => dc_info(ctx, &guild).await,
-        DcCmd::Search {
-            guild,
-            query,
-            channel,
-            limit,
-        } => dc_search(ctx, &guild, &query, channel.as_deref(), limit).await,
-        DcCmd::Roles { guild } => dc_roles(ctx, &guild).await,
-        DcCmd::Profile { user_id } => dc_profile(ctx, user_id.as_deref()).await,
-        DcCmd::Relationships => dc_relationships(ctx).await,
-        DcCmd::Threads { channel } => dc_threads(ctx, &channel).await,
-        DcCmd::Send {
-            channel,
-            text,
-            file,
-            reply,
-            typing,
-            confirm,
-            dry_run,
-            suppress_embeds,
-            mention_roles,
-        } => {
-            dc_send(
-                ctx,
-                &channel,
-                SendOpts {
-                    text: text.as_deref(),
-                    files: &file,
-                    reply: reply.as_deref(),
-                    typing,
-                    confirm,
-                    dry_run,
-                    suppress_embeds,
-                    mention_roles,
-                },
-            )
-            .await
-        }
-        DcCmd::Typing { channel } => dc_typing(ctx, &channel).await,
-        DcCmd::Join { invite, confirm } => dc_join(ctx, &invite, confirm).await,
-        DcCmd::Leave { guild, confirm } => dc_leave(ctx, &guild, confirm).await,
-        DcCmd::Presence { status } => dc_presence(ctx, status.as_deref()).await,
-        DcCmd::ThreadCreate {
-            channel,
-            name,
-            message_id,
-            text,
-            archive,
-            tags,
-        } => {
-            dc_thread_create(
-                ctx,
-                &channel,
-                &name,
-                message_id.as_deref(),
-                text.as_deref(),
-                archive,
-                tags.as_deref(),
-            )
-            .await
-        }
-        DcCmd::Edit {
-            channel,
-            message_id,
-            text,
-        } => dc_edit(ctx, &channel, &message_id, &text).await,
-        DcCmd::Delete {
-            channel,
-            message_id,
-            confirm,
-        } => dc_delete(ctx, &channel, &message_id, confirm).await,
-        DcCmd::React {
-            channel,
-            message_id,
-            emoji,
-        } => dc_react(ctx, &channel, &message_id, &emoji).await,
-        DcCmd::Unreact {
-            channel,
-            message_id,
-            emoji,
-        } => dc_unreact(ctx, &channel, &message_id, &emoji).await,
-        DcCmd::Pin {
-            channel,
-            message_id,
-        } => dc_pin(ctx, &channel, &message_id).await,
-        DcCmd::Pins { channel } => dc_pins(ctx, &channel).await,
-        DcCmd::Sync { channel, limit } => dc_sync(ctx, &channel, limit).await,
-        DcCmd::SyncAll { limit } => dc_sync_all(ctx, limit).await,
-        DcCmd::Tail { channel, once } => crate::commands::tail::dc_tail(ctx, &channel, once).await,
-        DcCmd::Watch {
-            channel,
-            keyword,
-            typing,
-        } => {
-            crate::commands::tail::dc_watch(ctx, channel.as_deref(), keyword.as_deref(), typing)
-                .await
-        }
-        DcCmd::DmGroup { cmd } => dc_dm_group(ctx, cmd).await,
-        DcCmd::Notify { cmd } => dc_notify(ctx, cmd).await,
-        DcCmd::TopReactions {
-            guild,
-            channel,
-            limit,
-        } => {
-            dc_top_reactions(
-                ctx,
-                guild.as_deref(),
-                channel.as_deref(),
-                limit.unwrap_or(10),
-            )
-            .await
-        }
-        DcCmd::Download {
-            guild,
-            channel,
-            r#type,
-            since,
-            min_reactions,
-            limit,
-            out,
-        } => {
-            crate::commands::download::dc_download(
-                ctx,
-                crate::commands::download::DownloadOpts {
-                    guild: guild.as_deref(),
-                    channel: channel.as_deref(),
-                    media_type: r#type.as_deref(),
-                    since: since.as_deref(),
-                    min_reactions,
-                    limit,
-                    out: out.as_deref(),
-                },
-            )
-            .await
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2657,19 +2210,20 @@ pub async fn dc_emoji_delete(ctx: &DcCtx, guild: &str, emoji: &str, confirm: boo
 // (F6)
 // ---------------------------------------------------------------------------
 
-/// Resolve a member to a user ID. For unban the target is NOT a guild member
-/// (banned users are gone from the member list), so resolve by bare ID or
-/// friend/relationship lookup; the member-list name match still applies for
-/// kick/ban/nick.
+/// Resolve a member to `(user_id, username)`. For unban the target is NOT a
+/// guild member (banned users are gone from the member list), so resolve by
+/// bare ID or friend/relationship lookup; the member-list name match still
+/// applies for kick/ban/nick. The member path uses ONE `list_members` call
+/// (was two — resolver + a display-name re-list).
 async fn resolve_user_id(
     client: &mut ApiClient,
     guild_id: &str,
     user: &str,
     member_list: bool,
-) -> Result<String, ExitCode> {
+) -> Result<(String, Option<String>), ExitCode> {
     if member_list {
-        match resolve::resolve_member(client, guild_id, user).await {
-            Ok(Some(id)) => return Ok(id),
+        match resolve::resolve_member_info(client, guild_id, user).await {
+            Ok(Some(pair)) => return Ok(pair),
             Ok(None) => {
                 return Err(ExitCode::from(output::emit_error(
                     "NotFound",
@@ -2682,7 +2236,7 @@ async fn resolve_user_id(
     }
     // Unban path: numeric ID passes through; else try relationships.
     if !user.is_empty() && user.chars().all(|c| c.is_ascii_digit()) {
-        return Ok(user.to_string());
+        return Ok((user.to_string(), None));
     }
     match client.relationships().await {
         Ok(rels) => {
@@ -2692,7 +2246,10 @@ async fn resolve_user_id(
                 .filter(|r| r.username.to_lowercase() == needle)
                 .collect();
             match matches.len() {
-                1 => Ok(matches[0].user_id.clone()),
+                1 => Ok((
+                    matches[0].user_id.clone(),
+                    Some(matches[0].username.clone()),
+                )),
                 n if n > 1 => Err(ExitCode::from(output::emit_error(
                     "Usage",
                     &format!("ambiguous user \"{user}\". {n} matches — use the user ID."),
@@ -2733,20 +2290,9 @@ pub async fn dc_member_kick(
         Ok(id) => id,
         Err(code) => return code,
     };
-    let user_id = match resolve_user_id(&mut client, &guild_id, user, true).await {
-        Ok(id) => id,
+    let (user_id, username) = match resolve_user_id(&mut client, &guild_id, user, true).await {
+        Ok(pair) => pair,
         Err(code) => return code,
-    };
-    let username = {
-        // Best-effort display name from the member list (already fetched by
-        // resolve_user_id). Re-list to keep the handler self-contained.
-        match client.list_members(&guild_id, 1000).await {
-            Ok(members) => members
-                .iter()
-                .find(|m| m.id == user_id)
-                .map(|m| m.username.clone()),
-            Err(_) => None,
-        }
     };
     match client.kick_member(&guild_id, &user_id, reason).await {
         Ok(()) => {
@@ -2794,16 +2340,9 @@ pub async fn dc_member_ban(
         Ok(id) => id,
         Err(code) => return code,
     };
-    let user_id = match resolve_user_id(&mut client, &guild_id, user, true).await {
-        Ok(id) => id,
+    let (user_id, username) = match resolve_user_id(&mut client, &guild_id, user, true).await {
+        Ok(pair) => pair,
         Err(code) => return code,
-    };
-    let username = match client.list_members(&guild_id, 1000).await {
-        Ok(members) => members
-            .iter()
-            .find(|m| m.id == user_id)
-            .map(|m| m.username.clone()),
-        Err(_) => None,
     };
     match client
         .ban_member(&guild_id, &user_id, reason, delete_days)
@@ -2839,8 +2378,8 @@ pub async fn dc_member_unban(ctx: &DcCtx, guild: &str, user: &str, confirm: bool
         Ok(id) => id,
         Err(code) => return code,
     };
-    let user_id = match resolve_user_id(&mut client, &guild_id, user, false).await {
-        Ok(id) => id,
+    let (user_id, _username) = match resolve_user_id(&mut client, &guild_id, user, false).await {
+        Ok(pair) => pair,
         Err(code) => return code,
     };
     match client.unban_member(&guild_id, &user_id).await {
@@ -2866,8 +2405,8 @@ pub async fn dc_member_nick(ctx: &DcCtx, guild: &str, user: &str, nickname: &str
         Ok(id) => id,
         Err(code) => return code,
     };
-    let user_id = match resolve_user_id(&mut client, &guild_id, user, true).await {
-        Ok(id) => id,
+    let (user_id, _username) = match resolve_user_id(&mut client, &guild_id, user, true).await {
+        Ok(pair) => pair,
         Err(code) => return code,
     };
     // Empty nickname → Some("") so the field is SENT and Discord clears it

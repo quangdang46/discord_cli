@@ -192,7 +192,7 @@ pub fn cmd_timeline(by: &str, format: Format) -> ExitCode {
                     } else {
                         "█".repeat(((b.count as f64 / max as f64) * WIDTH).round() as usize)
                     };
-                    println!("{} {bar} {}", b.bucket, b.count);
+                    output::out_line(&format!("{} {bar} {}", b.bucket, b.count));
                 }
             } else {
                 let _ = output::emit(&buckets, format);
@@ -278,7 +278,7 @@ pub fn cmd_export(channel: &str, as_json: bool, output: Option<&str>, format: Fo
                     )),
                 }
             } else {
-                println!("{}", text);
+                output::out_line(&text);
                 ExitCode::from(exit::OK)
             }
         }

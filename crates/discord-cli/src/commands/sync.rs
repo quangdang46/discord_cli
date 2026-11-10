@@ -117,21 +117,30 @@ pub async fn sync_channel(client: &mut ApiClient, channel_id: &str, limit: usize
     // messages on the next sync (wasted requests + rate-limit risk).
     let mut all_ids: Vec<&str> = msgs.iter().map(|m| m.message_id.as_str()).collect();
     all_ids.extend(new_msgs.iter().map(|m| m.message_id.as_str()));
+    // Snowflakes compare NUMERICALLY — lexical order breaks across digit
+    // counts ("9" > "10" as strings). Non-numeric falls back to lexical.
+    fn snow_ord(a: &str, b: &str) -> std::cmp::Ordering {
+        match (a.parse::<u64>(), b.parse::<u64>()) {
+            (Ok(x), Ok(y)) => x.cmp(&y),
+            _ => a.cmp(b),
+        }
+    }
     let newest = all_ids
         .iter()
         .copied()
-        .max()
+        .max_by(|a, b| snow_ord(a, b))
         .unwrap_or_default()
         .to_string();
     let oldest = all_ids
         .iter()
         .copied()
-        .min()
+        .min_by(|a, b| snow_ord(a, b))
         .unwrap_or_default()
         .to_string();
     if !newest.is_empty() {
-        ddb::update_sync_state(&conn, channel_id, &newest, &oldest)?;
+        ddb::update_sync_state(&tx, channel_id, &newest, &oldest)?;
     }
+    tx.commit()?;
     Ok(total)
 }
 
@@ -275,7 +284,7 @@ pub async fn dc_sync_follow(
                 "channel_id": channel_id,
                 "messages_synced": n,
             });
-            println!("{}", serde_json::to_string(&line).unwrap_or_default());
+            output::out_line(&serde_json::to_string(&line).unwrap_or_default());
         }
         Err(e) => {
             return ExitCode::from(output::emit_error("SyncError", &e.to_string(), exit::ERROR))
@@ -367,7 +376,7 @@ pub async fn dc_sync_follow(
         "followed": true,
         "duration_secs": dur,
     });
-    println!("{}", serde_json::to_string(&summary).unwrap_or_default());
+    output::out_line(&serde_json::to_string(&summary).unwrap_or_default());
     match result {
         Ok(()) => ExitCode::from(exit::OK),
         Err(e) => ExitCode::from(output::emit_error("SyncError", &e.to_string(), exit::ERROR)),

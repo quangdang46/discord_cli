@@ -107,7 +107,7 @@ pub async fn dc_tail(ctx: &DcCtx, channel_id: &str, once: bool) -> ExitCode {
                 "author": author,
                 "content": content,
             });
-            println!("{}", serde_json::to_string(&line).unwrap_or_default());
+            output::out_line(&serde_json::to_string(&line).unwrap_or_default());
         })
         .await;
 
@@ -193,7 +193,7 @@ pub async fn dc_watch(
                 "author": event.message.author.username,
                 "content": content,
             });
-            println!("{}", serde_json::to_string(&line).unwrap_or_default());
+            output::out_line(&serde_json::to_string(&line).unwrap_or_default());
         })
         .await;
 
@@ -220,7 +220,7 @@ pub async fn dc_watch(
                     "user_id": event.user_id,
                     "timestamp": event.timestamp,
                 });
-                println!("{}", serde_json::to_string(&line).unwrap_or_default());
+                output::out_line(&serde_json::to_string(&line).unwrap_or_default());
             })
             .await;
     }

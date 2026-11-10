@@ -56,8 +56,13 @@ struct Cli {
 enum Command {
     /// Validate the configured token (exit 1 on failure).
     Status,
-    /// Show the authenticated user's profile.
-    Whoami,
+    /// Show the authenticated user's profile. Email/phone (PII) are
+    /// redacted unless --full is given.
+    Whoami {
+        /// Include PII fields (email, phone).
+        #[arg(long)]
+        full: bool,
+    },
     /// List joined guilds (name/id/icon/owner).
     Guilds,
     /// List text/announcement/forum channels of a guild.
@@ -903,6 +908,15 @@ fn main() -> ExitCode {
 async fn run() -> ExitCode {
     load_env();
     let cli = Cli::parse();
+    // Mutually exclusive output selectors must be a usage error, not a
+    // silent precedence pick.
+    if cli.json && cli.yaml {
+        return ExitCode::from(output::emit_error(
+            "Usage",
+            "--json and --yaml are mutually exclusive",
+            exit::USAGE,
+        ));
+    }
     // Strict --format validation: unknown values must not silently fall back
     // to auto-detect (resolve_format ignores unrecognized strings).
     if let Some(f) = cli.format.as_deref() {
@@ -943,7 +957,7 @@ async fn run() -> ExitCode {
 
     match cli.command {
         Some(Command::Status) => cmd_status(&cli, format).await,
-        Some(Command::Whoami) => cmd_whoami(&cli, format).await,
+        Some(Command::Whoami { full }) => cmd_whoami(&cli, format, full).await,
         Some(Command::Guilds) => commands::dc::dc_guilds(ctx).await,
         Some(Command::Channels { guild }) => commands::dc::dc_channels(ctx, &guild).await,
         Some(Command::Dms) => commands::dc::dc_dms(ctx).await,
@@ -1465,7 +1479,7 @@ async fn run() -> ExitCode {
             // No subcommand: print help.
             let mut c = Cli::command();
             let _ = c.print_help();
-            println!();
+            output::out_line("");
             ExitCode::from(exit::OK)
         }
     }
@@ -1597,7 +1611,7 @@ async fn cmd_serve(cli: &Cli) -> ExitCode {
     }
 }
 
-async fn cmd_whoami(cli: &Cli, format: Format) -> ExitCode {
+async fn cmd_whoami(cli: &Cli, format: Format, full: bool) -> ExitCode {
     let mut client = match ApiClient::from_env(cli.token.as_deref()) {
         Ok(c) => c,
         Err(e) => {
@@ -1606,7 +1620,12 @@ async fn cmd_whoami(cli: &Cli, format: Format) -> ExitCode {
     };
 
     match client.get_me().await {
-        Ok(me) => {
+        Ok(mut me) => {
+            // PII (email/phone) is opt-in via --full.
+            if !full {
+                me.email = None;
+                me.phone = None;
+            }
             let _ = output::emit(&me, format);
             ExitCode::from(exit::OK)
         }

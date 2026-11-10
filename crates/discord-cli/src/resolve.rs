@@ -212,6 +212,57 @@ pub async fn resolve_member(
     }
 }
 
+/// Resolve a member for moderation commands (kick/ban/nick): ONE
+/// `list_members` call returning `(user_id, username)`.
+///
+/// Unlike [`resolve_member`] (bare-ID passthrough, id only), this always
+/// consults the member list so the caller gets the display username without
+/// a second fetch. Numeric input not present in the list still passes
+/// through with `username: None` (members beyond the 1000 cap, or already
+/// gone — the API call itself will then surface the real error).
+pub async fn resolve_member_info(
+    client: &mut ApiClient,
+    guild_id: &str,
+    name: &str,
+) -> Result<Option<(String, Option<String>)>, ExitCode> {
+    let numeric = !name.is_empty() && name.chars().all(|c| c.is_ascii_digit());
+    let members = client
+        .list_members(guild_id, 1000)
+        .await
+        .map_err(|e| api_err(&e))?;
+    let clean = name.trim_start_matches('@').to_lowercase();
+    let matches: Vec<&discord_core::types::Member> = members
+        .iter()
+        .filter(|m| {
+            m.id == name
+                || m.username.to_lowercase() == clean
+                || m.global_name
+                    .as_ref()
+                    .is_some_and(|g| g.to_lowercase() == clean)
+                || m.nick.as_ref().is_some_and(|n| n.to_lowercase() == clean)
+        })
+        .collect();
+    match matches.len() {
+        1 => Ok(Some((
+            matches[0].id.clone(),
+            Some(matches[0].username.clone()),
+        ))),
+        n if n > 1 => {
+            let names: Vec<String> = matches.iter().map(|m| m.username.clone()).collect();
+            Err(ExitCode::from(output::emit_error(
+                "Usage",
+                &format!(
+                    "ambiguous user \"{clean}\". Matches: {}. Use the user ID instead.",
+                    names.join(", ")
+                ),
+                exit::USAGE,
+            )))
+        }
+        _ if numeric => Ok(Some((name.to_string(), None))),
+        _ => Ok(None),
+    }
+}
+
 /// Resolve a custom emoji by name (`:name:` or bare) or ID.
 /// Name resolution requires a `list_emojis` call; ambiguity → exit 2;
 /// not-found → None.
@@ -249,57 +300,6 @@ pub async fn resolve_emoji(
             exit::USAGE,
         ))),
         _ => Ok(None),
-    }
-}
-
-/// Resolve a channel name or ID within a guild to a Channel.
-/// ID match first; else strip `#`, case-insensitive exact match.
-/// Ambiguity → stderr list + exit 1; not found → exit 3 (discli).
-#[allow(dead_code)] // used by tests; read/history resolve channels directly in dc.rs
-pub async fn resolve_channel(
-    client: &mut ApiClient,
-    guild_id: &str,
-    name: &str,
-) -> Result<Channel, ExitCode> {
-    let channels = client
-        .list_channels(guild_id)
-        .await
-        .map_err(|e| api_err(&e))?;
-
-    // ID match first.
-    if let Some(c) = channels.iter().find(|c| c.id == name) {
-        return Ok(c.clone());
-    }
-
-    // Strip # prefix + case-insensitive exact match.
-    let clean = name.strip_prefix('#').unwrap_or(name);
-    let needle = clean.to_lowercase();
-    let matches: Vec<&Channel> = channels
-        .iter()
-        .filter(|c| c.name.to_lowercase() == needle)
-        .collect();
-
-    match matches.len() {
-        1 => Ok(matches[0].clone()),
-        n if n > 1 => {
-            let names: Vec<String> = matches
-                .iter()
-                .map(|m| format!("#{} (type {})", m.name, m.channel_type))
-                .collect();
-            Err(ExitCode::from(output::emit_error(
-                "Usage",
-                &format!(
-                    "ambiguous channel \"{clean}\". Matches: {}. Use the channel ID instead.",
-                    names.join(", ")
-                ),
-                exit::USAGE,
-            )))
-        }
-        _ => Err(ExitCode::from(output::emit_error(
-            "NotFound",
-            &format!("channel \"{name}\" not found in guild {guild_id}."),
-            exit::NOT_FOUND,
-        ))),
     }
 }
 

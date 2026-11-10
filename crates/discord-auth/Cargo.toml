@@ -7,23 +7,17 @@ description = "Token auth: auto-detect (DPAPI+LevelDB), paste, keyring, per-inst
 
 [dependencies]
 tokio.workspace = true
-serde.workspace = true
 serde_json.workspace = true
 discord-core = { path = "../discord-core" }
 reqwest.workspace = true
 anyhow.workspace = true
-thiserror.workspace = true
-tracing.workspace = true
-uuid.workspace = true
 base64.workspace = true
-dotenvy.workspace = true
 dirs.workspace = true
 regex = "1"
 rsa = "0.9"
 sha2 = "0.10"
 qrcode = "0.14"
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-native-roots", "rustls-tls-webpki-roots"] }
-rustls = { version = "0.23", default-features = false, features = ["ring"] }
 futures-util = "0.3"
 rand.workspace = true
 

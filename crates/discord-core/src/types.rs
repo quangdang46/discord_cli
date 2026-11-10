@@ -19,10 +19,12 @@ pub fn snowflake_to_datetime(id: Snowflake) -> DateTime<Utc> {
 
 /// Convert a datetime to a snowflake (for `after` cursor).
 /// `ms = ts_ms - DISCORD_EPOCH; snowflake = ms << 22`.
+/// Pre-Discord-epoch (and pre-1970) inputs clamp to 0 — casting a negative
+/// `i64` to `u64` first would wrap to a huge snowflake.
 pub fn datetime_to_snowflake(dt: DateTime<Utc>) -> Snowflake {
-    const DISCORD_EPOCH: u64 = 1420070400000;
-    let ms = dt.timestamp_millis() as u64;
-    (ms.saturating_sub(DISCORD_EPOCH)) << 22
+    const DISCORD_EPOCH: i64 = 1420070400000;
+    let ms = dt.timestamp_millis();
+    ((ms - DISCORD_EPOCH).max(0) as u64) << 22
 }
 
 /// A guild the user has joined.
@@ -188,11 +190,14 @@ pub struct Message {
 pub struct Me {
     pub id: String,
     pub username: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub global_name: Option<String>,
-    #[serde(default)]
+    /// PII — populated by `GET /users/@me` but only emitted by `whoami
+    /// --full`; redact before serializing by setting to `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub email: Option<String>,
-    #[serde(default)]
+    /// PII — same redaction contract as `email`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub phone: Option<String>,
     #[serde(default)]
     pub mfa_enabled: bool,

@@ -164,6 +164,55 @@ pub struct GetMessageParams {
     pub message_id: String,
 }
 
+/// Edit own message parameter.
+#[derive(Serialize, Deserialize, JsonSchema)]
+pub struct EditMessageParams {
+    /// The channel ID (snowflake).
+    pub channel_id: String,
+    /// The message ID (snowflake).
+    pub message_id: String,
+    /// New message content.
+    pub content: String,
+}
+
+/// Delete own message parameter.
+#[derive(Serialize, Deserialize, JsonSchema)]
+pub struct DeleteMessageParams {
+    /// The channel ID (snowflake).
+    pub channel_id: String,
+    /// The message ID (snowflake).
+    pub message_id: String,
+    /// Must be true to delete (advisory — client-side approval).
+    pub confirm: bool,
+}
+
+/// React to a message parameter.
+#[derive(Serialize, Deserialize, JsonSchema)]
+pub struct ReactParams {
+    /// The channel ID (snowflake).
+    pub channel_id: String,
+    /// The message ID (snowflake).
+    pub message_id: String,
+    /// Emoji: unicode, `:name:`, or `name:id` custom-emoji form.
+    pub emoji: String,
+}
+
+/// Pin/unpin a message parameter.
+#[derive(Serialize, Deserialize, JsonSchema)]
+pub struct PinParams {
+    /// The channel ID (snowflake).
+    pub channel_id: String,
+    /// The message ID (snowflake).
+    pub message_id: String,
+}
+
+/// Channel-only parameter (typing indicator).
+#[derive(Serialize, Deserialize, JsonSchema)]
+pub struct ChannelParams {
+    /// The channel ID (snowflake).
+    pub channel_id: String,
+}
+
 /// List members parameter.
 #[derive(Serialize, Deserialize, JsonSchema)]
 pub struct MembersParams {
@@ -775,19 +824,6 @@ impl DiscordMcpServer {
         Ok(serde_json::to_string(&msgs).unwrap_or_else(|_| "[]".into()))
     }
 
-    /// Read a DM channel's recent messages.
-    #[tool(description = "Read recent messages from a DM channel (same as read_messages).")]
-    pub async fn read_dm(&self, Parameters(req): Parameters<ReadParams>) -> Result<String, String> {
-        let mut c = self.client()?;
-        let limit = req.limit.unwrap_or(50) as usize;
-        let before = parse_snowflake_opt(req.before.as_deref(), "before")?;
-        let msgs = c
-            .fetch_messages(&req.channel_id, limit, before, None)
-            .await
-            .map_err(|e| e.to_string())?;
-        Ok(serde_json::to_string(&msgs).unwrap_or_else(|_| "[]".into()))
-    }
-
     /// Top-reacted messages from the local archive (sync first).
     #[tool(
         description = "Rank archived messages by reaction count (hottest first). Requires prior sync."
@@ -983,6 +1019,89 @@ impl DiscordMcpServer {
             .await
             .map_err(|e| e.to_string())?;
         Ok(serde_json::to_string(&msg).unwrap_or_else(|_| "{}".into()))
+    }
+
+    /// Edit the content of the bot's own message.
+    #[tool(description = "Edit own message content (channel_id + message_id + new content).")]
+    pub async fn edit_message(
+        &self,
+        Parameters(req): Parameters<EditMessageParams>,
+    ) -> Result<String, String> {
+        let mut c = self.client()?;
+        c.edit_message(&req.channel_id, &req.message_id, &req.content)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(serde_json::json!({ "edited": true, "message_id": req.message_id }).to_string())
+    }
+
+    /// Delete own message (confirm gated, like the CLI).
+    #[tool(
+        description = "Delete own message. confirm must be true (advisory — client-side approval)."
+    )]
+    pub async fn delete_message(
+        &self,
+        Parameters(req): Parameters<DeleteMessageParams>,
+    ) -> Result<String, String> {
+        if !req.confirm {
+            return Err("delete_message requires confirm: true".into());
+        }
+        let mut c = self.client()?;
+        c.delete_message(&req.channel_id, &req.message_id)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(serde_json::json!({ "deleted": true, "message_id": req.message_id }).to_string())
+    }
+
+    /// Add own reaction (@me) to a message.
+    #[tool(description = "Add own reaction to a message. emoji: unicode, :name:, or name:id.")]
+    pub async fn add_reaction(
+        &self,
+        Parameters(req): Parameters<ReactParams>,
+    ) -> Result<String, String> {
+        let mut c = self.client()?;
+        c.add_reaction(&req.channel_id, &req.message_id, &req.emoji)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(serde_json::json!({ "reacted": true, "emoji": req.emoji }).to_string())
+    }
+
+    /// Remove own reaction from a message.
+    #[tool(description = "Remove own reaction from a message (same emoji forms as add_reaction).")]
+    pub async fn remove_reaction(
+        &self,
+        Parameters(req): Parameters<ReactParams>,
+    ) -> Result<String, String> {
+        let mut c = self.client()?;
+        c.remove_reaction(&req.channel_id, &req.message_id, &req.emoji)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(serde_json::json!({ "unreacted": true, "emoji": req.emoji }).to_string())
+    }
+
+    /// Pin a message in a channel.
+    #[tool(description = "Pin a message in a channel.")]
+    pub async fn pin_message(
+        &self,
+        Parameters(req): Parameters<PinParams>,
+    ) -> Result<String, String> {
+        let mut c = self.client()?;
+        c.pin_message(&req.channel_id, &req.message_id)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(serde_json::json!({ "pinned": true, "message_id": req.message_id }).to_string())
+    }
+
+    /// Send a typing indicator to a channel (one-shot).
+    #[tool(description = "Send a typing indicator to a channel.")]
+    pub async fn send_typing(
+        &self,
+        Parameters(req): Parameters<ChannelParams>,
+    ) -> Result<String, String> {
+        let mut c = self.client()?;
+        c.trigger_typing(&req.channel_id)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(serde_json::json!({ "typing": true, "channel_id": req.channel_id }).to_string())
     }
 
     /// List guild members.

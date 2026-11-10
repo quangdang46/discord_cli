@@ -160,6 +160,20 @@ fn emit_jsonl_rows<T: Serialize>(data: &T, out: &mut impl Write) -> std::io::Res
     Ok(())
 }
 
+/// Write one pre-formatted line to stdout (JSONL data, transcripts, help).
+///
+/// EPIPE is treated as a clean early exit — piped consumers like `| head`
+/// closing the pipe must not panic (unlike `println!`, which panics on
+/// EPIPE). Other I/O errors are also swallowed: stdout is best-effort in
+/// this CLI and errors already have a dedicated channel (`emit_error` →
+/// stderr). Use this for every data line instead of `println!`.
+pub fn out_line(line: &str) {
+    let stdout = std::io::stdout();
+    let mut lock = stdout.lock();
+    let _ = writeln!(lock, "{}", line);
+    let _ = lock.flush();
+}
+
 /// Write a progress/status message to stderr (never stdout).
 pub fn progress(msg: impl AsRef<str>) {
     eprint!("{}", msg.as_ref());

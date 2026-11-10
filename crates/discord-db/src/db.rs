@@ -168,6 +168,24 @@ pub fn get_sync_state(conn: &Connection, channel_id: &str) -> Result<(String, St
     }
 }
 
+/// Compare two snowflake-ish strings NUMERICALLY when both parse as u64 —
+/// lexical order breaks across digit counts ("9" > "10" as strings, but
+/// 9 < 10 as snowflakes). Non-numeric input falls back to lexical order.
+fn snow_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+    match (a.parse::<u64>(), b.parse::<u64>()) {
+        (Ok(x), Ok(y)) => x.cmp(&y),
+        _ => a.cmp(b),
+    }
+}
+
+/// Escape LIKE wildcards (`%`, `_`) and the escape char itself so user
+/// input matches literally. Pair with `ESCAPE '\'` in the SQL.
+fn like_escape(s: &str) -> String {
+    s.replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
+}
+
 /// Update sync state with max/min cursor semantics (langkurt).
 pub fn update_sync_state(
     conn: &Connection,
@@ -175,18 +193,32 @@ pub fn update_sync_state(
     newest_id: &str,
     oldest_id: &str,
 ) -> Result<()> {
+    // Merge in Rust: snowflakes must compare numerically (see snow_cmp).
+    // `last` keeps the max, `oldest` keeps the min (empty stored = unset).
+    let (cur_last, cur_oldest) = get_sync_state(conn, channel_id)?;
+    let last: &str = if snow_cmp(newest_id, &cur_last) == std::cmp::Ordering::Greater {
+        newest_id
+    } else {
+        cur_last.as_str()
+    };
+    let oldest: &str = if oldest_id.is_empty() {
+        cur_oldest.as_str()
+    } else if cur_oldest.is_empty() || snow_cmp(oldest_id, &cur_oldest) == std::cmp::Ordering::Less
+    {
+        oldest_id
+    } else {
+        cur_oldest.as_str()
+    };
     conn.execute(
         r#"
         INSERT INTO sync_state (channel_id, last_message_id, oldest_message_id, synced_at)
         VALUES (?1, ?2, ?3, datetime('now'))
         ON CONFLICT(channel_id) DO UPDATE SET
-            last_message_id = CASE WHEN excluded.last_message_id > last_message_id
-                                   THEN excluded.last_message_id ELSE last_message_id END,
-            oldest_message_id = CASE WHEN oldest_message_id='' OR excluded.oldest_message_id < oldest_message_id
-                                     THEN excluded.oldest_message_id ELSE oldest_message_id END,
+            last_message_id = excluded.last_message_id,
+            oldest_message_id = excluded.oldest_message_id,
             synced_at = excluded.synced_at
         "#,
-        params![channel_id, newest_id, oldest_id],
+        params![channel_id, last, oldest],
     )
     .context("update sync_state")?;
     Ok(())
@@ -211,8 +243,8 @@ pub fn recent_messages(
     );
     let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
     if let Some(ch) = channel_name {
-        sql.push_str(" AND c.name LIKE ?");
-        params.push(Box::new(format!("%{}%", ch)));
+        sql.push_str(" AND c.name LIKE ? ESCAPE '\\'");
+        params.push(Box::new(format!("%{}%", like_escape(ch))));
     }
     if let Some(h) = hours {
         sql.push_str(" AND m.timestamp >= datetime('now', ?)");
@@ -347,8 +379,8 @@ pub fn top_senders(
     );
     let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
     if let Some(ch) = channel_name {
-        sql.push_str(" AND c.name LIKE ?");
-        params.push(Box::new(format!("%{}%", ch)));
+        sql.push_str(" AND c.name LIKE ? ESCAPE '\\'");
+        params.push(Box::new(format!("%{}%", like_escape(ch))));
     }
     sql.push_str(" GROUP BY author_name ORDER BY cnt DESC LIMIT ?");
     params.push(Box::new(limit));
@@ -432,22 +464,36 @@ pub fn find_channel_id(conn: &Connection, name: &str) -> Result<Option<String>> 
         return Ok(Some(id));
     }
     let mut stmt = conn
-        .prepare("SELECT id FROM channels WHERE name LIKE ?1 LIMIT 1")
+        .prepare("SELECT id FROM channels WHERE name LIKE ?1 ESCAPE '\\' LIMIT 1")
         .context("prepare find_channel_id (fuzzy)")?;
+    let fuzzy = format!("%{}%", like_escape(name));
     let mut rows = stmt
-        .query(params![format!("%{}%", name)])
+        .query(params![fuzzy])
         .context("query find_channel_id (fuzzy)")?;
     Ok(rows.next()?.map(|r| r.get(0)).transpose()?)
 }
 
 /// Find a guild ID by name or ID (used by download --guild).
+/// Exact ID/name first, then substring — mirrors `find_channel_id` so
+/// partial guild names resolve like channel names do.
 pub fn find_guild_id(conn: &Connection, name: &str) -> Result<Option<String>> {
+    let exact = conn
+        .query_row(
+            "SELECT id FROM guilds WHERE id = ?1 OR name = ?2 LIMIT 1",
+            params![name, name],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(id) = exact {
+        return Ok(Some(id));
+    }
     let mut stmt = conn
-        .prepare("SELECT id FROM guilds WHERE id = ?1 OR name = ?2 LIMIT 1")
-        .context("prepare find_guild_id")?;
+        .prepare("SELECT id FROM guilds WHERE name LIKE ?1 ESCAPE '\\' LIMIT 1")
+        .context("prepare find_guild_id (fuzzy)")?;
+    let fuzzy = format!("%{}%", like_escape(name));
     let mut rows = stmt
-        .query(params![name, name])
-        .context("query find_guild_id")?;
+        .query(params![fuzzy])
+        .context("query find_guild_id (fuzzy)")?;
     Ok(rows.next()?.map(|r| r.get(0)).transpose()?)
 }
 
@@ -504,12 +550,15 @@ pub fn top_reacted(
     );
     let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
     if let Some(g) = guild_name {
-        sql.push_str(" AND g.name = ?");
+        // Accept guild ID or name (callers pass either; snowflakes never
+        // collide with real guild names in practice).
+        sql.push_str(" AND (g.id = ? OR g.name = ?)");
+        params.push(Box::new(g.to_string()));
         params.push(Box::new(g.to_string()));
     }
     if let Some(c) = channel_name {
-        sql.push_str(" AND c.name LIKE ?");
-        params.push(Box::new(format!("%{}%", c)));
+        sql.push_str(" AND c.name LIKE ? ESCAPE '\\'");
+        params.push(Box::new(format!("%{}%", like_escape(c))));
     }
     sql.push_str(" ORDER BY m.reaction_count DESC, m.id DESC LIMIT ?");
     params.push(Box::new(limit));

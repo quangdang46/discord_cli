@@ -101,7 +101,9 @@ pub async fn qr_login(timeout_secs: u64) -> Result<String> {
         .to_vec();
     let encoded_pub = base64::engine::general_purpose::STANDARD.encode(&der);
 
-    let mut heartbeat_ms: u64 = 41_250; // default; overwritten by hello
+    // Heartbeat timer, created on `hello` from the server-provided
+    // `heartbeat_interval` (was a hard-coded ≤5s tick).
+    let mut heartbeat: Option<tokio::time::Interval> = None;
     let mut fingerprint: Option<String> = None;
     let mut ticket: Option<String> = None; // assigned in pending_login
     let _ = &ticket; // silence clippy: init value replaced before read
@@ -113,34 +115,42 @@ pub async fn qr_login(timeout_secs: u64) -> Result<String> {
         if std::time::Instant::now() > deadline {
             return Err(anyhow::anyhow!("QR login timed out after {timeout_secs}s"));
         }
-        // Read next message (with a short read timeout so heartbeat can fire).
-        let msg = tokio::time::timeout(
-            std::time::Duration::from_millis(heartbeat_ms.min(5000)),
-            reader.next(),
-        )
-        .await;
-        let text = match msg {
-            Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Text(t)))) => t,
-            Ok(Some(Ok(_))) => continue, // binary/ping/pong — ignore
-            Ok(Some(Err(e))) => return Err(e).context("ws read"),
-            Ok(None) => return Err(anyhow::anyhow!("ws closed")),
-            Err(_elapsed) => {
-                // Heartbeat tick.
+        tokio::select! {
+            // Server-paced heartbeat (no tick until `hello` arrives).
+            _ = async {
+                match heartbeat.as_mut() {
+                    Some(iv) => iv.tick().await,
+                    None => std::future::pending().await,
+                }
+            } => {
                 writer
                     .send(tokio_tungstenite::tungstenite::Message::Text(
                         r#"{"op":"heartbeat"}"#.into(),
                     ))
                     .await
                     .context("send heartbeat")?;
-                continue;
             }
-        };
-        let v: serde_json::Value =
-            serde_json::from_str(&text).with_context(|| format!("bad json: {text}"))?;
-        let op = v["op"].as_str().unwrap_or_default();
-        match op {
+            msg = reader.next() => {
+                let text = match msg {
+                    Some(Ok(tokio_tungstenite::tungstenite::Message::Text(t))) => t,
+                    Some(Ok(_)) => continue, // binary/ping/pong — ignore
+                    Some(Err(e)) => return Err(e).context("ws read"),
+                    None => return Err(anyhow::anyhow!("ws closed")),
+                };
+                let v: serde_json::Value =
+                    serde_json::from_str(&text).with_context(|| format!("bad json: {text}"))?;
+                let op = v["op"].as_str().unwrap_or_default();
+                match op {
             "hello" => {
-                heartbeat_ms = v["heartbeat_interval"].as_u64().unwrap_or(41_250);
+                let interval_ms = v["heartbeat_interval"].as_u64().unwrap_or(41_250);
+                // Arm the heartbeat at the server-provided interval; skip
+                // the immediate first tick (intervals fire instantly).
+                let mut iv = tokio::time::interval(std::time::Duration::from_millis(
+                    interval_ms.max(1),
+                ));
+                iv.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                iv.tick().await;
+                heartbeat = Some(iv);
                 // Send init with our public key.
                 let init = serde_json::json!({
                     "op": "init",
@@ -176,12 +186,17 @@ pub async fn qr_login(timeout_secs: u64) -> Result<String> {
                 print_ascii_qr(&format!("https://discord.com/ra/{fp}"))?;
             }
             "pending_ticket" => {
-                // encrypted_user_payload = "discriminator:username" 4-part.
+                // encrypted_user_payload splits on ':' → [1]=discriminator,
+                // [3]=username (display only; see plan §QR flow).
                 let enc = v["encrypted_user_payload"].as_str().unwrap_or_default();
                 if let Ok(dec) = oaep_decrypt_b64(&priv_key, enc) {
                     if let Ok(plain) = String::from_utf8(dec) {
                         let parts: Vec<&str> = plain.split(':').collect();
-                        let user = parts.get(1).unwrap_or(&"?").to_string();
+                        let user = parts
+                            .get(3)
+                            .or_else(|| parts.get(1))
+                            .copied()
+                            .unwrap_or("?");
                         eprintln!("Waiting for \"{user}\" to scan...");
                     }
                 }
@@ -193,6 +208,8 @@ pub async fn qr_login(timeout_secs: u64) -> Result<String> {
             "cancel" => return Err(anyhow::anyhow!("login cancelled on device")),
             other => {
                 eprintln!("unhandled remote-auth op: {other}");
+            }
+                }
             }
         }
     }
@@ -209,6 +226,7 @@ pub async fn qr_login(timeout_secs: u64) -> Result<String> {
         .header("X-Fingerprint", &fp)
         .header("Referer", format!("https://discord.com/ra/{fp}"))
         .json(&serde_json::json!({ "ticket": ticket }))
+        .timeout(std::time::Duration::from_secs(15))
         .send()
         .await
         .context("ticket exchange request")?;
