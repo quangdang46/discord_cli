@@ -98,10 +98,26 @@ impl ApiClient {
     }
 
     /// Validate token: `GET /users/@me` returns 200.
+    ///
+    /// `Ok(false)` is reserved for genuine auth rejection
+    /// (`InvalidToken`/`AuthenticationFailed`); permission, transport, and
+    /// other API errors propagate as `Err` so callers never misreport a
+    /// network failure as "invalid token" (or vice versa).
     pub async fn validate(&mut self) -> Result<bool> {
         match self.get_me().await {
             Ok(_) => Ok(true),
-            Err(_) => Ok(false),
+            Err(e) => {
+                for cause in e.chain() {
+                    if let Some(derr) = cause.downcast_ref::<discord_user::DiscordError>() {
+                        return Ok(matches!(
+                            derr,
+                            discord_user::DiscordError::InvalidToken
+                                | discord_user::DiscordError::AuthenticationFailed
+                        ));
+                    }
+                }
+                Err(e)
+            }
         }
     }
 

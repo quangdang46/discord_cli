@@ -397,7 +397,17 @@ pub fn channel_messages(
 }
 
 /// Delete all stored messages for a channel. Returns rows deleted.
+///
+/// Also drops the channel's `sync_state` cursor: keeping it would make the
+/// next `sync` resume *after* the purged range and silently skip it forever
+/// (archive gap). The cursor is deleted first so a failure mid-purge can at
+/// worst cause a re-sync, never a gap.
 pub fn purge_channel(conn: &Connection, channel_id: &str) -> Result<usize> {
+    conn.execute(
+        "DELETE FROM sync_state WHERE channel_id = ?1",
+        params![channel_id],
+    )
+    .context("purge channel sync_state")?;
     let n = conn
         .execute(
             "DELETE FROM messages WHERE channel_id = ?1",

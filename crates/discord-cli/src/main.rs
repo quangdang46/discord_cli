@@ -1457,6 +1457,31 @@ async fn run() -> ExitCode {
     }
 }
 
+/// Map an API error to `(error code name, exit code)`.
+///
+/// Distinguishes auth failures (401 → InvalidToken/AuthenticationFailed) from
+/// permission (403 → PermissionDenied) and transport failures — callers must
+/// never collapse these into a generic `NotFound`/`ApiError`.
+fn api_error_parts(e: &anyhow::Error) -> (&'static str, u8) {
+    for cause in e.chain() {
+        if let Some(derr) = cause.downcast_ref::<discord_user::DiscordError>() {
+            use discord_user::DiscordError as DE;
+            return match derr {
+                DE::InvalidToken | DE::AuthenticationFailed => ("AuthError", exit::ERROR),
+                DE::PermissionDenied { .. } => ("Forbidden", exit::FORBIDDEN),
+                DE::NotFound { .. } => ("NotFound", exit::NOT_FOUND),
+                DE::RateLimited { .. } => ("RateLimited", exit::ERROR),
+                DE::Timeout | DE::Http(_) | DE::WebSocket(_) | DE::GatewayConnection(_) => {
+                    ("NetworkError", exit::NETWORK)
+                }
+                _ => ("ApiError", commands::dc::classify(e)),
+            };
+        }
+    }
+    // No DiscordError in the chain: transport/reqwest/timeout → network-ish.
+    ("NetworkError", exit::NETWORK)
+}
+
 async fn cmd_status(cli: &Cli, format: Format) -> ExitCode {
     let mut client = match ApiClient::from_env(cli.token.as_deref()) {
         Ok(c) => c,
@@ -1465,16 +1490,17 @@ async fn cmd_status(cli: &Cli, format: Format) -> ExitCode {
         }
     };
 
-    match client.validate().await {
-        Ok(true) => {
+    // `GET /users/@me` doubles as the auth probe: a bad/expired token must
+    // surface as an ERROR envelope, never `{ok:true, authenticated:false}`.
+    match client.get_me().await {
+        Ok(_) => {
             let data = serde_json::json!({ "authenticated": true });
             let _ = output::emit(&data, format);
             ExitCode::from(exit::OK)
         }
-        _ => {
-            let data = serde_json::json!({ "authenticated": false });
-            let _ = output::emit(&data, format);
-            ExitCode::from(exit::ERROR)
+        Err(e) => {
+            let (code, ec) = api_error_parts(&e);
+            ExitCode::from(output::emit_error(code, &e.to_string(), ec))
         }
     }
 }
@@ -1570,6 +1596,9 @@ async fn cmd_whoami(cli: &Cli, format: Format) -> ExitCode {
             let _ = output::emit(&me, format);
             ExitCode::from(exit::OK)
         }
-        Err(e) => ExitCode::from(output::emit_error("NotFound", &e.to_string(), exit::ERROR)),
+        Err(e) => {
+            let (code, ec) = api_error_parts(&e);
+            ExitCode::from(output::emit_error(code, &e.to_string(), ec))
+        }
     }
 }
