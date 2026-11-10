@@ -18,7 +18,9 @@ use discord_core::output::{self, exit};
 use discord_core::stealth::browser_user_agent;
 
 use super::dc::{classify, resolve_channel_id, DcCtx};
-use super::download::{parse_since, sanitise_name, time_to_snowflake};
+use super::download::{
+    parse_since, safe_filename, sanitise_name, time_to_snowflake, MAX_DOWNLOAD_BYTES,
+};
 
 /// Hosts we know how to extract an image from via og:image (langkurt
 /// ogimage.go:14-24). fxtwitter/vxtwitter/pxiv are the "better embed"
@@ -57,8 +59,13 @@ fn host_of(raw_url: &str) -> Option<String> {
     let rest = raw_url
         .strip_prefix("https://")
         .or_else(|| raw_url.strip_prefix("http://"))?;
-    let host = rest.split(['/', '?', '#']).next().unwrap_or("");
-    let host = host.split(':').next().unwrap_or(host); // strip port
+    let hostport = rest.split(['/', '?', '#']).next().unwrap_or("");
+    // Bracketed IPv6 literal (`[::1]:8080`) keeps its colons; else strip port.
+    let host = if let Some(inner) = hostport.strip_prefix('[') {
+        inner.split(']').next().unwrap_or(inner)
+    } else {
+        hostport.split(':').next().unwrap_or(hostport)
+    };
     let host = host.to_lowercase();
     if host.is_empty() {
         None
@@ -98,6 +105,64 @@ fn is_direct_image_url(raw_url: &str) -> bool {
     IMAGE_EXTS
         .iter()
         .any(|ext| path.ends_with(&format!(".{ext}")))
+}
+
+/// SSRF guard: may we open a direct connection to this host?
+///
+/// Message text is attacker-controlled, so a bare `http://169.254.169.254/…`
+/// or `http://localhost:8080/x.png` image link must never be fetched by this
+/// process (metadata endpoints, internal services). We block loopback,
+/// private, link-local, CGNAT, and documentation ranges plus obvious
+/// internal hostnames. DNS names that *resolve* to private IPs are a known
+/// residual gap (rebinding) — the proxy path delegates fetching to Discord
+/// and is unaffected.
+fn host_is_public(raw_url: &str) -> bool {
+    let Some(host) = host_of(raw_url) else {
+        return false;
+    };
+    let h = host.trim_end_matches('.');
+    if h == "localhost"
+        || h.ends_with(".localhost")
+        || h.ends_with(".local")
+        || h.ends_with(".internal")
+        || h.ends_with(".lan")
+        || h.ends_with(".home")
+        || h.ends_with(".corp")
+    {
+        return false;
+    }
+    if let Ok(ip) = h.parse::<std::net::Ipv4Addr>() {
+        let o = ip.octets();
+        // 0/8, 10/8, 100.64/10 (CGNAT), 127/8, 169.254/16, 172.16/12,
+        // 192.0.0/24 + 192.0.2/24 (IETF protocol assignments + TEST-NET-1),
+        // 192.168/16, 198.18/15 (benchmark), 198.51.100/24 + 203.0.113/24
+        // (TEST-NET-2/3), 224/4 multicast, 240/4 reserved.
+        let blocked = o[0] == 0
+            || o[0] == 10
+            || o[0] == 127
+            || (o[0] == 100 && (64..=127).contains(&o[1]))
+            || (o[0] == 169 && o[1] == 254)
+            || (o[0] == 172 && (16..=31).contains(&o[1]))
+            || (o[0] == 192 && o[1] == 168)
+            || (o[0] == 192 && o[1] == 0 && (o[2] == 0 || o[2] == 2))
+            || (o[0] == 198 && (o[1] == 18 || o[1] == 19 || (o[1] == 51 && o[2] == 100)))
+            || (o[0] == 203 && o[1] == 0 && o[2] == 113)
+            || o[0] >= 224;
+        return !blocked;
+    }
+    if let Ok(ip) = h.parse::<std::net::Ipv6Addr>() {
+        if let Some(v4) = ip.to_ipv4_mapped() {
+            return host_is_public(&format!("http://{v4}/"));
+        }
+        let seg0 = ip.segments()[0];
+        return !(ip.is_loopback()
+            || ip.is_unspecified()
+            || ip.is_multicast()
+            || (seg0 & 0xfe00) == 0xfc00 // fc00::/7 unique-local
+            || (seg0 & 0xffc0) == 0xfe80); // fe80::/10 link-local
+    }
+    // Ordinary DNS hostname — allowed (rebinding residual noted above).
+    true
 }
 
 /// All http(s) URLs in `content` worth processing: supported embed domains
@@ -231,6 +296,12 @@ async fn resolve_image_url(client: &reqwest::Client, page_url: &str) -> Result<S
     // proxying them via media.discordapp.net 401s for cdn.discordapp.com and
     // other hosts, and there's no og:image to scrape. Download them as-is.
     if is_direct_image_url(page_url) {
+        if !host_is_public(page_url) {
+            return Err(anyhow::anyhow!(
+                "refusing to fetch non-public host in {}",
+                host_of(page_url).unwrap_or_default()
+            ));
+        }
         return Ok(page_url.to_string());
     }
     // Fast path: try Discord's proxy first (discordapp.net excluded earlier,
@@ -256,7 +327,16 @@ async fn resolve_image_url(client: &reqwest::Client, page_url: &str) -> Result<S
     let html = fetch_head(client, page_url).await?.error_for_status()?;
     let body = html.bytes().await?;
     let body = String::from_utf8_lossy(&body[..body.len().min(128 * 1024)]);
-    extract_og_image(&body).ok_or_else(|| anyhow::anyhow!("no og:image on page"))
+    let og = extract_og_image(&body).ok_or_else(|| anyhow::anyhow!("no og:image on page"))?;
+    // og:image is attacker-influenced page content — same SSRF rule as
+    // direct image links before we connect to it ourselves.
+    if !host_is_public(&og) {
+        return Err(anyhow::anyhow!(
+            "refusing to fetch non-public og:image host {}",
+            host_of(&og).unwrap_or_default()
+        ));
+    }
+    Ok(og)
 }
 
 /// Download `img_url` into `dest_dir`, deriving the filename from the URL
@@ -274,14 +354,29 @@ async fn download_image(
     if name.is_empty() || name == "." || name == "/" {
         name = "image.jpg".into();
     }
-    let name = sanitise_name(&name);
+    let name = safe_filename(&name);
     let suffix = attachment_id(message_id, img_url);
     let local = dest_dir.join(format!("{}_{}", &suffix[..suffix.len().min(8)], name));
     if local.exists() {
         return Ok((local, true));
     }
+    // Last-line SSRF check: `img_url` may be a Discord proxy URL (public) or
+    // an og:image/direct URL already vetted — re-verify before connecting.
+    if !host_is_public(img_url) {
+        return Err(anyhow::anyhow!(
+            "refusing to download from non-public host {}",
+            host_of(img_url).unwrap_or_default()
+        ));
+    }
     let resp = client.get(img_url).send().await?.error_for_status()?;
     let bytes = resp.bytes().await?;
+    if bytes.len() as u64 > MAX_DOWNLOAD_BYTES {
+        return Err(anyhow::anyhow!(
+            "image too large ({} bytes > {} cap)",
+            bytes.len(),
+            MAX_DOWNLOAD_BYTES
+        ));
+    }
     std::fs::write(&local, &bytes)?;
     Ok((local, false))
 }
@@ -534,6 +629,27 @@ mod tests {
         assert_eq!(a.len(), 32);
         assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
         assert_ne!(a, attachment_id("43", "https://x.png"));
+    }
+
+    #[test]
+    fn ssrf_blocks_internal_hosts() {
+        // Loopback / private / link-local / CGNAT / internal names — all must
+        // be refused before any direct connection is opened.
+        assert!(!host_is_public("http://localhost:8080/x.png"));
+        assert!(!host_is_public("http://127.0.0.1/x.png"));
+        assert!(!host_is_public("http://169.254.169.254/latest/meta-data"));
+        assert!(!host_is_public("http://192.168.1.1/x.png"));
+        assert!(!host_is_public("http://10.0.0.5/x.png"));
+        assert!(!host_is_public("http://172.16.0.1/x.png"));
+        assert!(!host_is_public("http://100.64.0.1/x.png"));
+        assert!(!host_is_public("http://[::1]/x.png"));
+        assert!(!host_is_public("http://printer.local/x.png"));
+        assert!(!host_is_public("http://nas.internal/x.png"));
+        // Public hosts still pass.
+        assert!(host_is_public("https://example.com/cat.png"));
+        assert!(host_is_public("https://i.redd.it/abc123.png"));
+        assert!(host_is_public("https://8.8.8.8/dns.png"));
+        assert!(host_is_public("https://[2606:4700:4700::1111]/x.png"));
     }
 
     #[test]

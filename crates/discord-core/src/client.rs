@@ -21,6 +21,17 @@ pub struct ApiClient {
     client: Option<DiscordHttpClient>,
 }
 
+/// Outcome of [`ApiClient::resolve_guild`].
+#[derive(Debug)]
+pub enum GuildResolution {
+    /// Resolved to a single guild ID (exact ID/name or unique substring).
+    Found(String),
+    /// The name substring matched multiple guilds — caller must disambiguate.
+    Ambiguous(Vec<Guild>),
+    /// No guild matched.
+    NotFound,
+}
+
 impl ApiClient {
     /// Set the live gateway presence (Op 3) for an active connection.
     ///
@@ -113,18 +124,31 @@ impl ApiClient {
             .collect())
     }
 
-    /// Resolve a guild name or ID to a guild ID (jackwener `resolve_guild_id`).
-    /// Returns Ok(None) if not found.
-    pub async fn resolve_guild_id(&mut self, guild: &str) -> Result<Option<String>> {
-        if guild.chars().all(|c| c.is_ascii_digit()) {
-            return Ok(Some(guild.to_string()));
+    /// Resolve a guild name or ID.
+    ///
+    /// Matching order: numeric ID passthrough → case-insensitive exact name →
+    /// case-insensitive substring. Substring matches are *not* first-match:
+    /// a single match resolves, multiple matches return `Ambiguous` so the
+    /// caller can demand an exact ID instead of silently picking a server.
+    pub async fn resolve_guild(&mut self, guild: &str) -> Result<GuildResolution> {
+        if !guild.is_empty() && guild.chars().all(|c| c.is_ascii_digit()) {
+            return Ok(GuildResolution::Found(guild.to_string()));
         }
         let guilds = self.list_guilds().await?;
-        let needle = guild.to_lowercase();
-        Ok(guilds
+        let needle = guild.trim_start_matches('#').to_lowercase();
+        // Exact name beats substring.
+        if let Some(g) = guilds.iter().find(|g| g.name.to_lowercase() == needle) {
+            return Ok(GuildResolution::Found(g.id.clone()));
+        }
+        let matches: Vec<Guild> = guilds
             .into_iter()
-            .find(|g| g.name.to_lowercase().contains(&needle))
-            .map(|g| g.id))
+            .filter(|g| g.name.to_lowercase().contains(&needle))
+            .collect();
+        match matches.len() {
+            0 => Ok(GuildResolution::NotFound),
+            1 => Ok(GuildResolution::Found(matches[0].id.clone())),
+            _ => Ok(GuildResolution::Ambiguous(matches)),
+        }
     }
 
     /// `GET /guilds/{id}/channels` — channels of a guild (text-like filtered).

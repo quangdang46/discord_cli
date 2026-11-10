@@ -99,7 +99,9 @@ enum Command {
         since: Option<String>,
         /// Compact plain-text transcript `[HH:MM:SS] author: content`
         /// — ~5x smaller than JSON, ideal for AI summarization.
-        #[arg(long)]
+        /// Conflicts with --json/--yaml/--format: a transcript is plain text
+        /// and would break machine-readable output purity.
+        #[arg(long, conflicts_with_all = ["json", "yaml", "format"])]
         transcript: bool,
     },
     /// List guild members.
@@ -817,6 +819,9 @@ enum Command {
         /// Grant temporary membership.
         #[arg(long)]
         temporary: bool,
+        /// Mark the invite unique (single-use regardless of max-uses).
+        #[arg(long)]
+        unique: bool,
     },
     /// Delete an invite by code or URL (admin; MANAGE_CHANNELS).
     InviteDelete {
@@ -1393,9 +1398,12 @@ async fn run() -> ExitCode {
             max_age,
             max_uses,
             temporary,
+            unique,
         }) => {
-            commands::dc::dc_invite_create(ctx, &guild, &channel, max_age, max_uses, temporary)
-                .await
+            commands::dc::dc_invite_create(
+                ctx, &guild, &channel, max_age, max_uses, temporary, unique,
+            )
+            .await
         }
         Some(Command::InviteDelete {
             code,

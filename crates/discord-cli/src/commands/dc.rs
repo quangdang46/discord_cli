@@ -1410,10 +1410,20 @@ pub async fn dc_sync_all(ctx: &DcCtx, limit: usize) -> ExitCode {
     };
     let mut total = 0usize;
     let mut channels_synced = 0usize;
+    // Per-target failures are collected and emitted — silently `continue`-ing
+    // would report a partial archive as a clean success.
+    let mut failures: Vec<serde_json::Value> = Vec::new();
     for g in &guilds {
         let channels = match client.list_channels(&g.id).await {
             Ok(c) => c,
-            Err(_) => continue, // skip guilds we can't read
+            Err(e) => {
+                failures.push(serde_json::json!({
+                    "guild_id": g.id.as_str(),
+                    "guild_name": g.name.as_str(),
+                    "error": format!("list_channels failed: {e}"),
+                }));
+                continue;
+            }
         };
         for ch in channels {
             match crate::commands::sync::sync_channel(&mut client, &ch.id, limit).await {
@@ -1421,15 +1431,27 @@ pub async fn dc_sync_all(ctx: &DcCtx, limit: usize) -> ExitCode {
                     total += n;
                     channels_synced += 1;
                 }
-                Err(_) => continue,
+                Err(e) => {
+                    failures.push(serde_json::json!({
+                        "channel_id": ch.id,
+                        "channel_name": ch.name,
+                        "error": e.to_string(),
+                    }));
+                }
             }
         }
     }
     let data = serde_json::json!({
         "channels_synced": channels_synced,
         "messages_total": total,
+        "errors": failures,
     });
     let _ = output::emit(&data, ctx.format);
+    // All-or-nothing honesty: if every attempted channel failed, this is an
+    // error, not a success with zero work done.
+    if channels_synced == 0 && !data["errors"].as_array().is_none_or(|a| a.is_empty()) {
+        return ExitCode::from(exit::ERROR);
+    }
     ExitCode::from(exit::OK)
 }
 
@@ -3229,7 +3251,7 @@ pub async fn dc_invite_list(ctx: &DcCtx, guild: &str) -> ExitCode {
     }
 }
 
-/// `invite-create <GUILD> <CHANNEL> [--max-age N] [--max-uses N] [--temporary]`
+/// `invite-create <GUILD> <CHANNEL> [--max-age N] [--max-uses N] [--temporary] [--unique]`
 /// Create an invite in a text channel (CREATE_INSTANT_INVITE). Not
 /// destructive — no --confirm required (matches the send-with-reply path).
 pub async fn dc_invite_create(
@@ -3239,6 +3261,7 @@ pub async fn dc_invite_create(
     max_age: Option<u32>,
     max_uses: Option<u32>,
     temporary: bool,
+    unique: bool,
 ) -> ExitCode {
     let mut client = match ctx.client().await {
         Ok(c) => c,
@@ -3251,8 +3274,11 @@ pub async fn dc_invite_create(
     let channel_id = match resolve::resolve_channel_admin(&mut client, &guild_id, channel).await {
         Ok(Some(id)) => id,
         Ok(None) => {
-            eprintln!("Channel \"{channel}\" not found in guild {guild_id}.");
-            return ExitCode::from(exit::NOT_FOUND);
+            return ExitCode::from(output::emit_error(
+                "NotFound",
+                &format!("channel \"{channel}\" not found in guild {guild_id}."),
+                exit::NOT_FOUND,
+            ));
         }
         Err(code) => return code,
     };
@@ -3260,8 +3286,10 @@ pub async fn dc_invite_create(
         max_age,
         max_uses,
         temporary: Some(temporary),
-        // unique recommended for one-time links (discli invite.ts).
-        unique: Some(true),
+        // `unique` is opt-in: forcing it true silently contradicted
+        // `--max-uses` (a "unique" invite is single-use regardless of the
+        // use count the caller asked for).
+        unique: Some(unique),
         ..Default::default()
     };
     match client.create_channel_invite(&channel_id, req).await {

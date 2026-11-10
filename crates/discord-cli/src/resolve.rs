@@ -9,21 +9,47 @@
 
 use std::process::ExitCode;
 
-use discord_core::client::ApiClient;
-use discord_core::output::exit;
+use discord_core::client::{ApiClient, GuildResolution};
+use discord_core::output::{self, exit};
 use discord_core::types::{Channel, Role};
 
+/// Emit a structured error envelope for a resolver API failure and return the
+/// matching exit code (admin commands must never leak plain `error:` text —
+/// agents parse `{ok:false,error:{code}}`).
+fn api_err(e: &anyhow::Error) -> ExitCode {
+    ExitCode::from(output::emit_error(
+        "ApiError",
+        &e.to_string(),
+        crate::commands::dc::classify(e),
+    ))
+}
+
 /// Resolve a guild name or ID to a guild ID.
-/// Errors (exit 3) if not found.
+/// Errors (exit 3) if not found; exit 2 with candidates on ambiguity.
 pub async fn resolve_guild(client: &mut ApiClient, name: &str) -> Result<String, ExitCode> {
-    if let Some(id) = client.resolve_guild_id(name).await.map_err(|e| {
-        eprintln!("error: {e}");
-        ExitCode::from(exit::ERROR)
-    })? {
-        return Ok(id);
+    match client.resolve_guild(name).await {
+        Ok(GuildResolution::Found(id)) => Ok(id),
+        Ok(GuildResolution::Ambiguous(guilds)) => {
+            let names: Vec<String> = guilds
+                .iter()
+                .map(|g| format!("\"{}\" ({})", g.name, g.id))
+                .collect();
+            Err(ExitCode::from(output::emit_error(
+                "Usage",
+                &format!(
+                    "ambiguous guild \"{name}\". Matches: {}. Use the guild ID instead.",
+                    names.join(", ")
+                ),
+                exit::USAGE,
+            )))
+        }
+        Ok(GuildResolution::NotFound) => Err(ExitCode::from(output::emit_error(
+            "NotFound",
+            &format!("guild \"{name}\" not found. Use `discord dc guilds` to list."),
+            exit::NOT_FOUND,
+        ))),
+        Err(e) => Err(api_err(&e)),
     }
-    eprintln!("Guild \"{name}\" not found. Use `discord dc guilds` to list.");
-    Err(ExitCode::from(exit::NOT_FOUND))
 }
 
 /// Resolve a channel name or ID within a guild (admin variant).
@@ -37,10 +63,10 @@ pub async fn resolve_channel_admin(
     guild_id: &str,
     name: &str,
 ) -> Result<Option<String>, ExitCode> {
-    let channels = client.get_guild_channels_all(guild_id).await.map_err(|e| {
-        eprintln!("error: {e}");
-        ExitCode::from(exit::ERROR)
-    })?;
+    let channels = client
+        .get_guild_channels_all(guild_id)
+        .await
+        .map_err(|e| api_err(&e))?;
 
     // ID match first.
     if let Some(c) = channels.iter().find(|c| c.id == name) {
@@ -62,11 +88,14 @@ pub async fn resolve_channel_admin(
                 .iter()
                 .map(|m| format!("#{} (type {})", m.name, m.channel_type))
                 .collect();
-            eprintln!(
-                "Ambiguous channel \"{clean}\". Matches: {}",
-                names.join(", ")
-            );
-            Err(ExitCode::from(exit::USAGE))
+            Err(ExitCode::from(output::emit_error(
+                "Usage",
+                &format!(
+                    "ambiguous channel \"{clean}\". Matches: {}. Use the channel ID instead.",
+                    names.join(", ")
+                ),
+                exit::USAGE,
+            )))
         }
         _ => Ok(None),
     }
@@ -79,10 +108,10 @@ pub async fn resolve_category(
     guild_id: &str,
     name: &str,
 ) -> Result<Option<String>, ExitCode> {
-    let channels = client.get_guild_channels_all(guild_id).await.map_err(|e| {
-        eprintln!("error: {e}");
-        ExitCode::from(exit::ERROR)
-    })?;
+    let channels = client
+        .get_guild_channels_all(guild_id)
+        .await
+        .map_err(|e| api_err(&e))?;
     let categories: Vec<&Channel> = channels.iter().filter(|c| c.channel_type == 4).collect();
 
     if let Some(c) = categories.iter().find(|c| c.id == name) {
@@ -96,10 +125,11 @@ pub async fn resolve_category(
         .collect();
     match matches.len() {
         1 => Ok(Some(matches[0].id.clone())),
-        n if n > 1 => {
-            eprintln!("Ambiguous category \"{clean}\". Use an ID instead.");
-            Err(ExitCode::from(exit::USAGE))
-        }
+        n if n > 1 => Err(ExitCode::from(output::emit_error(
+            "Usage",
+            &format!("ambiguous category \"{clean}\". Use the category ID instead."),
+            exit::USAGE,
+        ))),
         _ => Ok(None),
     }
 }
@@ -112,10 +142,7 @@ pub async fn resolve_role(
     guild_id: &str,
     name: &str,
 ) -> Result<Option<String>, ExitCode> {
-    let roles = client.list_roles(guild_id).await.map_err(|e| {
-        eprintln!("error: {e}");
-        ExitCode::from(exit::ERROR)
-    })?;
+    let roles = client.list_roles(guild_id).await.map_err(|e| api_err(&e))?;
     if let Some(r) = roles.iter().find(|r| r.id == name) {
         return Ok(Some(r.id.clone()));
     }
@@ -129,8 +156,14 @@ pub async fn resolve_role(
         1 => Ok(Some(matches[0].id.clone())),
         n if n > 1 => {
             let names: Vec<String> = matches.iter().map(|m| format!("@{}", m.name)).collect();
-            eprintln!("Ambiguous role \"{clean}\". Matches: {}", names.join(", "));
-            Err(ExitCode::from(exit::USAGE))
+            Err(ExitCode::from(output::emit_error(
+                "Usage",
+                &format!(
+                    "ambiguous role \"{clean}\". Matches: {}. Use the role ID instead.",
+                    names.join(", ")
+                ),
+                exit::USAGE,
+            )))
         }
         _ => Ok(None),
     }
@@ -147,10 +180,10 @@ pub async fn resolve_member(
     if !name.is_empty() && name.chars().all(|c| c.is_ascii_digit()) {
         return Ok(Some(name.to_string()));
     }
-    let members = client.list_members(guild_id, 1000).await.map_err(|e| {
-        eprintln!("error: {e}");
-        ExitCode::from(exit::ERROR)
-    })?;
+    let members = client
+        .list_members(guild_id, 1000)
+        .await
+        .map_err(|e| api_err(&e))?;
     let clean = name.trim_start_matches('@').to_lowercase();
     let matches: Vec<&discord_core::types::Member> = members
         .iter()
@@ -166,8 +199,14 @@ pub async fn resolve_member(
         1 => Ok(Some(matches[0].id.clone())),
         n if n > 1 => {
             let names: Vec<String> = matches.iter().map(|m| m.username.clone()).collect();
-            eprintln!("Ambiguous user \"{clean}\". Matches: {}", names.join(", "));
-            Err(ExitCode::from(exit::USAGE))
+            Err(ExitCode::from(output::emit_error(
+                "Usage",
+                &format!(
+                    "ambiguous user \"{clean}\". Matches: {}. Use the user ID instead.",
+                    names.join(", ")
+                ),
+                exit::USAGE,
+            )))
         }
         _ => Ok(None),
     }
@@ -181,10 +220,10 @@ pub async fn resolve_emoji(
     guild_id: &str,
     name_or_id: &str,
 ) -> Result<Option<discord_user::types::GuildEmoji>, ExitCode> {
-    let emojis = client.list_emojis(guild_id).await.map_err(|e| {
-        eprintln!("error: {e}");
-        ExitCode::from(exit::ERROR)
-    })?;
+    let emojis = client
+        .list_emojis(guild_id)
+        .await
+        .map_err(|e| api_err(&e))?;
     // Bare-ID passthrough.
     if let Some(e) = emojis.iter().find(|e| e.id == name_or_id) {
         return Ok(Some(e.clone()));
@@ -204,10 +243,11 @@ pub async fn resolve_emoji(
         .collect();
     match matches.len() {
         1 => Ok(Some(matches[0].clone())),
-        n if n > 1 => {
-            eprintln!("Ambiguous emoji \"{clean}\". Use an ID instead.");
-            Err(ExitCode::from(exit::USAGE))
-        }
+        n if n > 1 => Err(ExitCode::from(output::emit_error(
+            "Usage",
+            &format!("ambiguous emoji \"{clean}\". Use the emoji ID instead."),
+            exit::USAGE,
+        ))),
         _ => Ok(None),
     }
 }
@@ -221,10 +261,10 @@ pub async fn resolve_channel(
     guild_id: &str,
     name: &str,
 ) -> Result<Channel, ExitCode> {
-    let channels = client.list_channels(guild_id).await.map_err(|e| {
-        eprintln!("error: {e}");
-        ExitCode::from(exit::ERROR)
-    })?;
+    let channels = client
+        .list_channels(guild_id)
+        .await
+        .map_err(|e| api_err(&e))?;
 
     // ID match first.
     if let Some(c) = channels.iter().find(|c| c.id == name) {
@@ -246,16 +286,20 @@ pub async fn resolve_channel(
                 .iter()
                 .map(|m| format!("#{} (type {})", m.name, m.channel_type))
                 .collect();
-            eprintln!(
-                "Ambiguous channel \"{clean}\". Matches: {}",
-                names.join(", ")
-            );
-            Err(ExitCode::from(exit::USAGE))
+            Err(ExitCode::from(output::emit_error(
+                "Usage",
+                &format!(
+                    "ambiguous channel \"{clean}\". Matches: {}. Use the channel ID instead.",
+                    names.join(", ")
+                ),
+                exit::USAGE,
+            )))
         }
-        _ => {
-            eprintln!("Channel \"{name}\" not found in guild {guild_id}.");
-            Err(ExitCode::from(exit::NOT_FOUND))
-        }
+        _ => Err(ExitCode::from(output::emit_error(
+            "NotFound",
+            &format!("channel \"{name}\" not found in guild {guild_id}."),
+            exit::NOT_FOUND,
+        ))),
     }
 }
 

@@ -73,6 +73,22 @@ pub(crate) fn sanitise_name(name: &str) -> String {
         .collect()
 }
 
+/// Sanitise an attachment *filename* for joining under a download dir.
+/// `sanitise_name` covers path separators; this additionally rejects empty
+/// results so the on-disk name is never blank.
+pub(crate) fn safe_filename(name: &str) -> String {
+    let s = sanitise_name(name);
+    if s.trim().is_empty() {
+        "attachment".to_string()
+    } else {
+        s
+    }
+}
+
+/// Hard cap on one downloaded file — a hostile/buggy archive entry (or a
+/// huge Discord attachment) must not fill the disk. Shared with fetch-links.
+pub(crate) const MAX_DOWNLOAD_BYTES: u64 = 256 * 1024 * 1024; // 256 MiB
+
 /// Download a single attachment (plain GET with browser UA). Returns bytes.
 async fn fetch_attachment(url: &str) -> Result<Vec<u8>> {
     let client = reqwest::Client::builder()
@@ -220,7 +236,19 @@ pub async fn dc_download(ctx: &DcCtx, opts: DownloadOpts<'_>) -> ExitCode {
             .chars()
             .rev()
             .collect();
-        let local = dir.join(format!("{suffix}_{}", a.filename));
+        // Skip files the archive already knows are over the cap — don't even
+        // fetch them.
+        if a.size.is_some_and(|s| s > MAX_DOWNLOAD_BYTES as i64) {
+            skipped += 1;
+            eprintln!(
+                "\rskipping {} ({} bytes > {} cap)",
+                a.filename,
+                a.size.unwrap_or(0),
+                MAX_DOWNLOAD_BYTES
+            );
+            continue;
+        }
+        let local = dir.join(format!("{suffix}_{}", safe_filename(&a.filename)));
         if local.exists() {
             skipped += 1;
             let _ =
@@ -231,6 +259,20 @@ pub async fn dc_download(ctx: &DcCtx, opts: DownloadOpts<'_>) -> ExitCode {
         eprint!("\rDownloading {}... ", local.display());
         match fetch_attachment(&a.url).await {
             Ok(bytes) => {
+                // Content-Length may be absent/lied about — enforce the cap
+                // on the actual bytes received too.
+                if bytes.len() as u64 > MAX_DOWNLOAD_BYTES {
+                    eprintln!(
+                        "\rskipping {} (downloaded {} bytes > {} cap)",
+                        a.filename,
+                        bytes.len(),
+                        MAX_DOWNLOAD_BYTES
+                    );
+                    skipped += 1;
+                    eprint!("\r\x1b[K");
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                    continue;
+                }
                 if let Err(e) = std::fs::write(&local, &bytes) {
                     eprintln!("\rfailed to write {}: {e}", local.display());
                     continue;

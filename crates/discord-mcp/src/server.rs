@@ -495,6 +495,11 @@ pub struct CreateInviteParams {
     /// Grant temporary membership.
     #[serde(default)]
     pub temporary: Option<bool>,
+    /// Mark the invite unique (single-use regardless of max_uses). Omit to
+    /// let Discord default (false); do NOT combine with max_uses>1 blindly —
+    /// unique overrides the use-count semantics.
+    #[serde(default)]
+    pub unique: Option<bool>,
 }
 
 /// Delete an invite (MANAGE_CHANNELS; advisory confirm).
@@ -588,6 +593,18 @@ pub struct EditGuildParams {
     pub rules_channel: Option<String>,
 }
 
+/// Parse an optional snowflake param; invalid input is an error, never a
+/// silent `None` (which would silently widen the query to "latest").
+fn parse_snowflake_opt(s: Option<&str>, field: &str) -> Result<Option<u64>, String> {
+    match s {
+        None => Ok(None),
+        Some(v) => v
+            .parse::<u64>()
+            .map(Some)
+            .map_err(|_| format!("invalid {field} snowflake: {v:?}")),
+    }
+}
+
 /// The MCP server.
 #[derive(Clone)]
 pub struct DiscordMcpServer {
@@ -652,7 +669,7 @@ impl DiscordMcpServer {
     ) -> Result<String, String> {
         let mut c = self.client()?;
         let limit = req.limit.unwrap_or(50) as usize;
-        let before = req.before.as_deref().and_then(|s| s.parse().ok());
+        let before = parse_snowflake_opt(req.before.as_deref(), "before")?;
         let msgs = c
             .fetch_messages(&req.channel_id, limit, before, None)
             .await
@@ -747,7 +764,7 @@ impl DiscordMcpServer {
     pub async fn read_dm(&self, Parameters(req): Parameters<ReadParams>) -> Result<String, String> {
         let mut c = self.client()?;
         let limit = req.limit.unwrap_or(50) as usize;
-        let before = req.before.as_deref().and_then(|s| s.parse().ok());
+        let before = parse_snowflake_opt(req.before.as_deref(), "before")?;
         let msgs = c
             .fetch_messages(&req.channel_id, limit, before, None)
             .await
@@ -1603,7 +1620,7 @@ impl DiscordMcpServer {
 
     /// Create a channel invite (CREATE_INSTANT_INVITE; not destructive).
     #[tool(
-        description = "Create a guild invite for a text channel. Sets unique=true (one-time link). Not destructive; no confirm needed."
+        description = "Create a guild invite for a text channel. `unique` defaults to false; set it only for genuinely single-use links (it overrides max_uses semantics). Not destructive; no confirm needed."
     )]
     pub async fn create_invite(
         &self,
@@ -1614,7 +1631,7 @@ impl DiscordMcpServer {
             max_age: req.max_age,
             max_uses: req.max_uses,
             temporary: req.temporary,
-            unique: Some(true),
+            unique: req.unique,
             ..Default::default()
         };
         let inv = c
