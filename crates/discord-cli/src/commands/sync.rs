@@ -75,12 +75,10 @@ pub(crate) async fn ensure_channel_row(
 
 /// Sync one channel into SQLite. Returns message count written.
 pub async fn sync_channel(client: &mut ApiClient, channel_id: &str, limit: usize) -> Result<usize> {
-    let conn = open_db()?;
+    let mut conn = open_db()?;
     let ch_guild = ensure_channel_row(&conn, client, channel_id).await?;
 
     let (last_id, oldest_id) = ddb::get_sync_state(&conn, channel_id)?;
-    let mut total = 0usize;
-    let mut new_msgs: Vec<discord_core::types::Message> = Vec::new();
 
     // Phase B (history backward) — always runs to backfill.
     let before = if oldest_id.is_empty() {
@@ -91,23 +89,25 @@ pub async fn sync_channel(client: &mut ApiClient, channel_id: &str, limit: usize
     let msgs = client
         .fetch_messages(channel_id, limit, before, None)
         .await?;
-    for m in &msgs {
-        ddb::upsert_message(&conn, &row_from_msg(m, channel_id, ch_guild.as_deref()))?;
-        upsert_attachments(&conn, m, channel_id)?;
-    }
-    total += msgs.len();
 
     // Phase A (new, forward) — only when we have a last cursor.
-    if !last_id.is_empty() {
+    let new_msgs = if last_id.is_empty() {
+        Vec::new()
+    } else {
         let after: Option<u64> = last_id.parse().ok();
-        new_msgs = client
+        client
             .fetch_messages(channel_id, limit, None, after)
-            .await?;
-        for m in &new_msgs {
-            ddb::upsert_message(&conn, &row_from_msg(m, channel_id, ch_guild.as_deref()))?;
-            upsert_attachments(&conn, m, channel_id)?;
-        }
-        total += new_msgs.len();
+            .await?
+    };
+    let total = msgs.len() + new_msgs.len();
+
+    // All writes in ONE transaction: hundreds of autocommit upserts were
+    // fsync-per-row. Fetches already completed, so the write lock is held
+    // only for the (fast) local writes.
+    let tx = conn.transaction()?;
+    for m in msgs.iter().chain(new_msgs.iter()) {
+        ddb::upsert_message(&tx, &row_from_msg(m, channel_id, ch_guild.as_deref()))?;
+        upsert_attachments(&tx, m, channel_id)?;
     }
 
     // Compute new cursors from BOTH phases: newest = max id seen across

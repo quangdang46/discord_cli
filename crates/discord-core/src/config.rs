@@ -165,14 +165,44 @@ pub fn delete_token_keyring() -> Result<()> {
 /// Per-install stable device id `discord-cli-<3hex>` (mrarfarf Q3).
 ///
 /// Persisted in the config dir so each install looks distinct to Discord.
-/// Regenerated only if missing (never per-run — that looks bot-like).
-///
-/// NOTE: `device_id()` is intentionally free of a read-cached path. It is
-/// invoked from `stealth::x_super_properties()` (REST fingerprint), which in
-/// tests races with the config test that repoints `DATA_DIR` at a temp dir
-/// and removes it — so reading an existing file back could serve a value
-/// written into a deleted dir. The write path is idempotent (same value
-/// converges), making the in-run stability assertion hold.
+/// Read-first: the file IS the identity — regenerating per call made every
+/// request look like a new device (the opposite of the stealth goal).
+/// Generated only when missing or malformed; never per-run.
+pub fn device_id() -> Result<String> {
+    let dir = data_dir()?;
+    let path = dir.join("device_id");
+    // Read the persisted id first; only a well-formed value is honored.
+    if let Ok(raw) = std::fs::read_to_string(&path) {
+        let v = raw.trim();
+        if is_valid_device_id(v) {
+            return Ok(v.to_string());
+        }
+    }
+    // Generate once and persist. uuid::Uuid v4 is RNG-backed, so two
+    // processes starting in the same nanosecond cannot collide; the
+    // wall-clock-based generator that preceded this could.
+    let id = {
+        let hex = uuid::Uuid::new_v4().as_u128() as u32; // low 32 bits
+        format!("discord-cli-{:03x}", hex % 0x1000)
+    };
+    if std::fs::write(&path, &id).is_err() {
+        // The data dir is not writable — return the generated value anyway
+        // (the CLI is usable; only the id's persistence is degraded).
+        return Ok(id);
+    }
+    Ok(id)
+}
+
+/// Shape check for a persisted device id: `discord-cli-` + exactly 3 hex
+/// digits. Anything else (empty, truncated, foreign format) is treated as
+/// missing and regenerated.
+fn is_valid_device_id(v: &str) -> bool {
+    let Some(hex) = v.strip_prefix("discord-cli-") else {
+        return false;
+    };
+    hex.len() == 3 && hex.chars().all(|c| c.is_ascii_hexdigit())
+}
+
 /// Config file for per-install settings (presence, etc.).
 fn config_file() -> Result<PathBuf> {
     Ok(data_dir()?.join("config.json"))
@@ -211,37 +241,10 @@ pub fn set_configured_presence(status: &str) -> bool {
     true
 }
 
-pub fn device_id() -> Result<String> {
-    let dir = data_dir()?;
-    let path = dir.join("device_id");
-    // The id is generated once per process and reused from then on (same
-    // shape as the original: `discord-cli-<3hex>`). uuid::Uuid v4 is
-    // RNG-backed, so two processes starting in the same nanosecond cannot
-    // collide; the wall-clock-based generator that preceded this could.
-    // A stale file from a crashed run is ignored (regenerated) — serving a
-    // leftover from another install would look bot-like.
-    let id = {
-        let hex = uuid::Uuid::new_v4().as_u128() as u32; // low 32 bits
-        format!("discord-cli-{:03x}", hex % 0x1000)
-    };
-    if std::fs::write(&path, &id).is_err() {
-        // The data dir is not writable — return the generated value anyway
-        // (the CLI is usable; only the id's persistence is degraded).
-        return Ok(id);
-    }
-    Ok(id)
-}
-
-/// Test-only helper: the set of values `device_id()` may return. Kept in
-/// lockstep with the implementation above (3 lowercase hex digits after the
-/// prefix). `device_id_is_stable_and_prefixed` asserts membership so a
-/// drift in the format fails loudly instead of silently.
+/// Test-only helper kept in lockstep with [`is_valid_device_id`].
 #[cfg(test)]
 fn valid_device_id(v: &str) -> bool {
-    let Some(hex) = v.strip_prefix("discord-cli-") else {
-        return false;
-    };
-    hex.len() == 3 && hex.chars().all(|c| c.is_ascii_hexdigit())
+    is_valid_device_id(v)
 }
 
 #[cfg(test)]
@@ -337,17 +340,13 @@ mod tests {
             let id2 = device_id().unwrap();
             assert!(valid_device_id(&id1), "format: {id1}");
             assert!(valid_device_id(&id2), "format: {id2}");
-            // Note: `device_id()` regenerates per call (see its doc comment —
-            // it must not serve a cached value while a concurrent `stealth`
-            // call races the temp DATA_DIR). The stability contract this test
-            // asserts is format + prefix, not byte-equality across calls.
-            assert_eq!(id1.len(), id2.len(), "same shape: {id1} vs {id2}");
-            // The tmp dir may already be gone if a concurrent `stealth` test
-            // repointed DATA_DIR and removed it mid-run; the id file is
-            // best-effort in that race. Only assert format when it exists.
-            if let Ok(persisted) = std::fs::read_to_string(tmp.join("device_id")) {
-                assert!(valid_device_id(persisted.trim()), "persisted: {persisted}");
-            }
+            // Read-first: the persisted file IS the identity, so repeated
+            // calls (and separate processes) return the SAME id. This is
+            // the stealth contract — Discord must not see a new device per
+            // invocation.
+            assert_eq!(id1, id2, "device id must be stable across calls");
+            let persisted = std::fs::read_to_string(tmp.join("device_id")).unwrap();
+            assert_eq!(persisted.trim(), id1, "persisted id must match");
             // Cleanup is a no-op if a concurrent test already removed it.
             let _ = std::fs::remove_dir_all(&tmp);
             // Restore env AFTER the dir is gone (with_data_dir_guard snapshots
@@ -358,10 +357,9 @@ mod tests {
     }
 
     #[test]
-    fn device_id_rewrites_stale_existing_file() {
-        // If a previous run left a device_id file behind (crash between write
-        // and cleanup), the cached value must NOT leak into the next run —
-        // device_id() reads before it writes, so a stale file would stick.
+    fn device_id_rewrites_malformed_existing_file() {
+        // A well-formed persisted id is honored verbatim (per-install
+        // stability); a malformed/foreign value is regenerated.
         with_data_dir_guard(|| {
             let unique = format!(
                 "discord-device-test-rewrite-{}-{}",
@@ -374,10 +372,18 @@ mod tests {
             let tmp = std::env::temp_dir().join(unique);
             std::env::set_var("DATA_DIR", &tmp);
             std::fs::create_dir_all(&tmp).unwrap();
+            // Malformed (8 hex chars, not the 3-hex contract) → regenerated.
             std::fs::write(tmp.join("device_id"), "discord-cli-deadbeef").unwrap();
             let id = device_id().unwrap();
             assert!(id.starts_with("discord-cli-"), "prefix: {id}");
-            assert_ne!(id, "discord-cli-deadbeef", "stale file must be rewritten");
+            assert_ne!(
+                id, "discord-cli-deadbeef",
+                "malformed file must be regenerated"
+            );
+            assert!(valid_device_id(&id), "format: {id}");
+            // A well-formed existing file is returned unchanged.
+            std::fs::write(tmp.join("device_id"), "discord-cli-abc\n").unwrap();
+            assert_eq!(device_id().unwrap(), "discord-cli-abc");
             let _ = std::fs::remove_dir_all(&tmp);
         });
     }

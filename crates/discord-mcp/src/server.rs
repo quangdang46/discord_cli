@@ -609,24 +609,30 @@ fn parse_snowflake_opt(s: Option<&str>, field: &str) -> Result<Option<u64>, Stri
 #[derive(Clone)]
 pub struct DiscordMcpServer {
     tool_router: ToolRouter<Self>,
-    /// Token supplied via `discord serve --token`; when `None`, tools fall
-    /// back to the standard env/.env/keyring resolution chain.
-    token: Option<String>,
+    /// Token resolved ONCE at construction: the CLI `--token` flag when
+    /// given, else the env/.env/keyring chain. Cached because per-tool-call
+    /// resolution hit the OS keyring (D-Bus/Keychain IPC) on every single
+    /// tool invocation — a real latency cost inside the async runtime.
+    token: Result<String, String>,
 }
 
 impl DiscordMcpServer {
     pub fn new(token: Option<String>) -> Self {
+        let resolved =
+            discord_core::config::resolve_token(token.as_deref()).map_err(|e| e.to_string());
         Self {
             tool_router: Self::tool_router(),
-            token,
+            token: resolved,
         }
     }
 
     fn client(&self) -> Result<ApiClient, String> {
-        match &self.token {
-            Some(t) => Ok(ApiClient::with_token(t.clone())),
-            None => ApiClient::from_env(None).map_err(|e| e.to_string()),
-        }
+        // `with_token` is cheap: the HTTP client (and its super-properties)
+        // is built lazily on first request, and `device_id()` is now a
+        // stable read-first file lookup — no per-call keyring or UUID churn.
+        Ok(ApiClient::with_token(
+            self.token.clone().map_err(|e| e.clone())?,
+        ))
     }
 }
 
@@ -713,7 +719,10 @@ impl DiscordMcpServer {
                 // Server-local attachment load (same caps as CLI: 10 files, 10MiB).
                 let mut atts = Vec::with_capacity(paths.len());
                 for path in paths {
-                    let data = std::fs::read(path)
+                    // Async fs: attachments can be up to 10MiB each — a
+                    // blocking std::fs::read here would stall the executor.
+                    let data = tokio::fs::read(path)
+                        .await
                         .map_err(|e| format!("cannot read file \"{path}\": {e}"))?;
                     if data.len() > 10 * 1024 * 1024 {
                         return Err(format!("file too large (>10MiB): {path}"));

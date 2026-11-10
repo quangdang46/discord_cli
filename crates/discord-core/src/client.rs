@@ -1808,7 +1808,11 @@ impl ApiClient {
         let cid: u64 = channel_id.parse().context("invalid channel id")?;
         let inner = self.inner()?;
         let mut all: Vec<RawMessage> = Vec::new();
-        let mut remaining = limit.min(1000);
+        // No artificial cap: `limit` is honored in full (sync's documented
+        // default is 5000). Discord caps each request at 100 messages, so
+        // large limits paginate; the inter-page sleep below keeps us
+        // rate-limit friendly.
+        let mut remaining = limit;
         let mut cur_before = before;
         let mut cur_after = after;
 
@@ -1826,8 +1830,6 @@ impl ApiClient {
                 break;
             }
             remaining = remaining.saturating_sub(n);
-            // Small delay between pages to be rate-limit friendly (jackwener).
-            tokio::time::sleep(std::time::Duration::from_millis(400 + (randish() % 400))).await;
 
             if after.is_some() {
                 cur_after = msgs[0].id.parse().ok();
@@ -1835,9 +1837,14 @@ impl ApiClient {
                 cur_before = msgs[n - 1].id.parse().ok();
             }
             all.extend(msgs);
-            if n < batch as usize {
+            // Another page only when the batch was full AND we still owe
+            // messages — otherwise this was the last page and the 400-800ms
+            // politeness sleep would be dead latency on every call.
+            if n < batch as usize || remaining == 0 {
                 break;
             }
+            // Small delay between pages to be rate-limit friendly (jackwener).
+            tokio::time::sleep(std::time::Duration::from_millis(400 + (randish() % 400))).await;
         }
 
         // Sort ascending by id (jackwener sorts by msg_id ascending).
