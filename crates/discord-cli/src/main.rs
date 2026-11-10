@@ -1486,7 +1486,7 @@ async fn cmd_auth(save: bool, paste: bool, qr: bool, format: Format) -> ExitCode
         match discord_auth::qr::qr_login(120).await {
             Ok(token) => {
                 if save {
-                    if let Err(e) = discord_auth::auth::save_token_to_env(&token, None) {
+                    if let Err(e) = discord_auth::auth::save_token(&token, None) {
                         return ExitCode::from(output::emit_error(
                             "AuthError",
                             &e.to_string(),
@@ -1533,7 +1533,7 @@ async fn cmd_auth(save: bool, paste: bool, qr: bool, format: Format) -> ExitCode
     for (source, token) in &tokens {
         if let Ok(true) = discord_auth::auth::validate_token(token).await {
             if save {
-                let _ = discord_auth::auth::save_token_to_env(token, None);
+                let _ = discord_auth::auth::save_token(token, None);
             }
             let _ = output::emit(
                 &serde_json::json!({ "authenticated": true, "source": source, "token_saved": save }),

@@ -337,19 +337,25 @@ pub enum DmGroupCmd {
 pub enum NotifyCmd {
     /// Mute/unmute a guild or set notification level.
     Guild {
-        /// Guild ID.
+        /// Guild ID or name substring.
         guild: String,
         /// Mute (true) or unmute (false).
         #[arg(long)]
         muted: Option<bool>,
+        /// Notification level: all_messages or only_mentions.
+        #[arg(long)]
+        level: Option<String>,
     },
-    /// Mute/unmute a channel.
+    /// Mute/unmute a channel or set its notification level.
     Channel {
         /// Channel ID.
         channel: String,
         /// Mute (true) or unmute (false).
         #[arg(long)]
         muted: Option<bool>,
+        /// Notification level: all_messages or only_mentions.
+        #[arg(long)]
+        level: Option<String>,
     },
 }
 
@@ -3561,18 +3567,165 @@ pub async fn dc_dm_group(ctx: &DcCtx, cmd: DmGroupCmd) -> ExitCode {
     }
 }
 
-/// `dc notify ...` — notification settings (best-effort via guild settings).
+/// `dc notify ...` — real notification settings via
+/// `PATCH /users/@me/guilds/{id}/settings` (user-scoped overrides; NOT the
+/// guild-wide default edited by `server-set`). Never reports success without
+/// the API call succeeding.
 pub async fn dc_notify(ctx: &DcCtx, cmd: NotifyCmd) -> ExitCode {
-    let _ = ctx;
+    use discord_core::output::{self, exit};
+    use std::process::ExitCode;
+
+    /// `--muted`/`--level` → settings JSON fragment. `Err` = usage problem.
+    fn settings_body(
+        muted: Option<bool>,
+        level: Option<&str>,
+    ) -> std::result::Result<serde_json::Value, String> {
+        let mut body = serde_json::Map::new();
+        if let Some(m) = muted {
+            body.insert("muted".to_string(), serde_json::Value::Bool(m));
+        }
+        if let Some(l) = level {
+            // Discord: 0 = ALL_MESSAGES, 1 = ONLY_MENTIONS.
+            let n = match l {
+                "all_messages" => 0,
+                "only_mentions" => 1,
+                other => {
+                    return Err(format!(
+                        "invalid --level \"{other}\" (expected all_messages|only_mentions)"
+                    ))
+                }
+            };
+            body.insert("message_notifications".to_string(), serde_json::json!(n));
+        }
+        if body.is_empty() {
+            return Err("nothing to change: pass --muted and/or --level".to_string());
+        }
+        Ok(serde_json::Value::Object(body))
+    }
+
+    let mut client = match ctx.client().await {
+        Ok(c) => c,
+        Err(code) => return code,
+    };
     match cmd {
-        NotifyCmd::Guild { guild, muted } => {
-            let data = serde_json::json!({ "guild": guild, "muted": muted, "note": "notification settings via API pending" });
-            let _ = output::emit(&data, Format::Json);
+        NotifyCmd::Guild {
+            guild,
+            muted,
+            level,
+        } => {
+            let body = match settings_body(muted, level.as_deref()) {
+                Ok(b) => b,
+                Err(msg) => return ExitCode::from(output::emit_error("Usage", &msg, exit::USAGE)),
+            };
+            let guild_id = match client.resolve_guild(&guild).await {
+                Ok(discord_core::client::GuildResolution::Found(id)) => id,
+                Ok(discord_core::client::GuildResolution::Ambiguous(guilds)) => {
+                    let names: Vec<String> = guilds
+                        .iter()
+                        .map(|g| format!("\"{}\" ({})", g.name, g.id))
+                        .collect();
+                    return ExitCode::from(output::emit_error(
+                        "Usage",
+                        &format!(
+                            "ambiguous guild \"{guild}\". Matches: {}. Use the guild ID instead.",
+                            names.join(", ")
+                        ),
+                        exit::USAGE,
+                    ));
+                }
+                Ok(discord_core::client::GuildResolution::NotFound) => {
+                    return ExitCode::from(output::emit_error(
+                        "NotFound",
+                        &format!("guild \"{guild}\" not found"),
+                        exit::NOT_FOUND,
+                    ))
+                }
+                Err(e) => {
+                    return ExitCode::from(output::emit_error(
+                        "ApiError",
+                        &e.to_string(),
+                        classify(&e),
+                    ))
+                }
+            };
+            if let Err(e) = client
+                .patch_guild_notification_settings(&guild_id, body)
+                .await
+            {
+                return ExitCode::from(output::emit_error(
+                    "ApiError",
+                    &e.to_string(),
+                    classify(&e),
+                ));
+            }
+            let _ = output::emit(
+                &serde_json::json!({
+                    "guild_id": guild_id,
+                    "muted": muted,
+                    "level": level,
+                    "applied": true,
+                }),
+                ctx.format,
+            );
             ExitCode::from(exit::OK)
         }
-        NotifyCmd::Channel { channel, muted } => {
-            let data = serde_json::json!({ "channel": channel, "muted": muted, "note": "notification settings via API pending" });
-            let _ = output::emit(&data, Format::Json);
+        NotifyCmd::Channel {
+            channel,
+            muted,
+            level,
+        } => {
+            let body = match settings_body(muted, level.as_deref()) {
+                Ok(b) => b,
+                Err(msg) => return ExitCode::from(output::emit_error("Usage", &msg, exit::USAGE)),
+            };
+            if !is_numeric(&channel) {
+                return ExitCode::from(output::emit_error(
+                    "Usage",
+                    &format!("invalid channel id \"{channel}\" (numeric snowflake required)"),
+                    exit::USAGE,
+                ));
+            }
+            // Channel overrides live under the parent guild's user settings.
+            let ch = match client.get_channel(&channel).await {
+                Ok(c) => c,
+                Err(e) => {
+                    return ExitCode::from(output::emit_error(
+                        "ApiError",
+                        &e.to_string(),
+                        classify(&e),
+                    ))
+                }
+            };
+            let Some(guild_id) = ch.guild_id.clone() else {
+                return ExitCode::from(output::emit_error(
+                    "Usage",
+                    &format!("channel \"{channel}\" is a DM — guild notification overrides require a guild channel"),
+                    exit::USAGE,
+                ));
+            };
+            let mut overrides = serde_json::Map::new();
+            overrides.insert(channel.clone(), body);
+            let payload = serde_json::json!({ "channel_overrides": overrides });
+            if let Err(e) = client
+                .patch_guild_notification_settings(&guild_id, payload)
+                .await
+            {
+                return ExitCode::from(output::emit_error(
+                    "ApiError",
+                    &e.to_string(),
+                    classify(&e),
+                ));
+            }
+            let _ = output::emit(
+                &serde_json::json!({
+                    "channel_id": channel,
+                    "guild_id": guild_id,
+                    "muted": muted,
+                    "level": level,
+                    "applied": true,
+                }),
+                ctx.format,
+            );
             ExitCode::from(exit::OK)
         }
     }

@@ -141,7 +141,31 @@ pub fn save_token_to_env(token: &str, env_path: Option<&PathBuf>) -> Result<()> 
         lines.push(format!("DISCORD_TOKEN={token}"));
     }
     std::fs::write(&path, lines.join("\n") + "\n").context("write .env")?;
+    // A file holding a live token must not be world-readable (Unix).
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .context("chmod 0600 token file")?;
+    }
+    if env_path.is_none() {
+        eprintln!(
+            "warning: DISCORD_TOKEN written to ./.env in plaintext — prefer OS keyring storage"
+        );
+    }
     Ok(())
+}
+
+/// Save a token using the preferred storage: OS keyring first, `.env` fallback.
+///
+/// Keyring is preferred because `.env` is plaintext and easy to commit by
+/// accident; when no keyring backend is available we still persist to `.env`
+/// (chmod 0600) so `--save` never silently drops the token.
+pub fn save_token(token: &str, env_path: Option<&PathBuf>) -> Result<()> {
+    match discord_core::config::save_token_keyring(token) {
+        Ok(()) => Ok(()),
+        Err(_) => save_token_to_env(token, env_path),
+    }
 }
 
 /// Validate a token against `GET /users/@me` via discord-core.
@@ -167,7 +191,7 @@ pub async fn auth_paste(save: bool) -> Result<String> {
         return Err(anyhow!("invalid token"));
     }
     if save {
-        save_token_to_env(&token, None)?;
+        save_token(&token, None)?;
     }
     Ok(token)
 }

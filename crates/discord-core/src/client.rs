@@ -944,6 +944,32 @@ impl ApiClient {
         self.edit_guild(guild_id, req).await
     }
 
+    /// `PATCH /users/@me/guilds/{id}/settings` — the calling user's own
+    /// notification settings for a guild (Discord user-settings endpoint, not
+    /// the guild-wide default edited by `edit_guild`).
+    ///
+    /// `body` is a JSON object carrying any subset of:
+    /// - `muted` (bool) — server-level mute
+    /// - `message_notifications` (int) — `0` = ALL_MESSAGES, `1` = ONLY_MENTIONS
+    /// - `channel_overrides` (object) — per-channel `{muted, message_notifications}`
+    ///
+    /// Returns 204 No Content.
+    pub async fn patch_guild_notification_settings(
+        &mut self,
+        guild_id: &str,
+        body: serde_json::Value,
+    ) -> Result<()> {
+        let gid: u64 = guild_id.parse().context("invalid guild id")?;
+        let inner = self.inner()?;
+        inner
+            .patch_no_response(
+                Route::Custom(format!("users/@me/guilds/{gid}/settings").into()),
+                body,
+            )
+            .await
+            .context("PATCH /users/@me/guilds/{id}/settings failed")
+    }
+
     /// `GET /users/@me/relationships` — friends/blocked/pending.
     pub async fn relationships(&mut self) -> Result<Vec<crate::types::Relationship>> {
         let inner = self.inner()?;
