@@ -21,6 +21,14 @@ pub fn cmd_search(
     limit: usize,
     format: Format,
 ) -> ExitCode {
+    // Empty/whitespace query is a usage error, not a DB error.
+    if query.trim().is_empty() {
+        return ExitCode::from(output::emit_error(
+            "UsageError",
+            "empty search query",
+            exit::USAGE,
+        ));
+    }
     let db_path = match config::db_path() {
         Ok(p) => p,
         Err(e) => {
@@ -220,6 +228,14 @@ pub fn cmd_stats(format: Format) -> ExitCode {
 
 /// `export <CHANNEL> [-f text|json] [-o FILE]` — export stored messages.
 pub fn cmd_export(channel: &str, as_json: bool, output: Option<&str>, format: Format) -> ExitCode {
+    // An empty channel selector must never silently mean "everything".
+    if channel.trim().is_empty() {
+        return ExitCode::from(output::emit_error(
+            "Usage",
+            "channel is required (ID or name) — refusing to export all channels",
+            exit::USAGE,
+        ));
+    }
     let db_path = match config::db_path() {
         Ok(p) => p,
         Err(e) => {
@@ -255,9 +271,11 @@ pub fn cmd_export(channel: &str, as_json: bool, output: Option<&str>, format: Fo
                         let _ = output::emit(&data, format);
                         ExitCode::from(exit::OK)
                     }
-                    Err(e) => {
-                        ExitCode::from(output::emit_error("IOError", &e.to_string(), exit::ERROR))
-                    }
+                    Err(e) => ExitCode::from(output::emit_error(
+                        "IOError",
+                        &e.to_string(),
+                        super::dc::EXIT_ATTACHMENT,
+                    )),
                 }
             } else {
                 println!("{}", text);
@@ -270,6 +288,14 @@ pub fn cmd_export(channel: &str, as_json: bool, output: Option<&str>, format: Fo
 
 /// `purge <CHANNEL> [-y]` — delete stored messages for a channel.
 pub fn cmd_purge(channel: &str, yes: bool, format: Format) -> ExitCode {
+    // An empty channel selector must never silently mean "purge everything".
+    if channel.trim().is_empty() {
+        return ExitCode::from(output::emit_error(
+            "Usage",
+            "channel is required (ID or name) — refusing to purge all channels",
+            exit::USAGE,
+        ));
+    }
     if !yes {
         eprintln!("This will delete stored messages for channel \"{channel}\". Add -y to proceed.");
         return ExitCode::from(exit::USAGE);

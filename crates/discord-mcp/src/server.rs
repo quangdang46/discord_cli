@@ -609,23 +609,30 @@ fn parse_snowflake_opt(s: Option<&str>, field: &str) -> Result<Option<u64>, Stri
 #[derive(Clone)]
 pub struct DiscordMcpServer {
     tool_router: ToolRouter<Self>,
+    /// Token supplied via `discord serve --token`; when `None`, tools fall
+    /// back to the standard env/.env/keyring resolution chain.
+    token: Option<String>,
 }
 
 impl DiscordMcpServer {
-    pub fn new() -> Self {
+    pub fn new(token: Option<String>) -> Self {
         Self {
             tool_router: Self::tool_router(),
+            token,
         }
     }
 
     fn client(&self) -> Result<ApiClient, String> {
-        ApiClient::from_env(None).map_err(|e| e.to_string())
+        match &self.token {
+            Some(t) => Ok(ApiClient::with_token(t.clone())),
+            None => ApiClient::from_env(None).map_err(|e| e.to_string()),
+        }
     }
 }
 
 impl Default for DiscordMcpServer {
     fn default() -> Self {
-        Self::new()
+        Self::new(None)
     }
 }
 
@@ -1720,8 +1727,11 @@ impl ServerHandler for DiscordMcpServer {
 }
 
 /// Run the server over stdio (called by the `serve` subcommand).
-pub async fn serve_stdio() -> anyhow::Result<()> {
-    let server = DiscordMcpServer::new()
+///
+/// `token` is the CLI `--token` flag value; `None` falls back to env/.env/
+/// keyring resolution inside each tool call.
+pub async fn serve_stdio(token: Option<String>) -> anyhow::Result<()> {
+    let server = DiscordMcpServer::new(token)
         .serve(rmcp::transport::stdio())
         .await?;
     server.waiting().await?;

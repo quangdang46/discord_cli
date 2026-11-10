@@ -529,12 +529,39 @@ pub fn top_reacted(
         .context("collect top_reacted")
 }
 
-/// FTS5 full-text search over stored messages (langkurt SQL, bind verbatim).
+/// Build a safe FTS5 MATCH expression from free-text input.
+///
+/// Raw user input is FTS5 *syntax*, not text: `foo"bar`, bare `AND`/`OR`/`NOT`,
+/// `*`, unbalanced parens, or `NEAR(...)` either error at prepare time or —
+/// worse — silently change the query's meaning. Each whitespace-separated
+/// term is emitted as a double-quoted phrase (embedded `"` doubled per FTS5
+/// escaping rules) and terms are ANDed, so arbitrary input degrades to a
+/// literal-term search instead of crashing row iteration with a generic
+/// "search row" `DbError`.
+///
+/// Returns `Err` for empty/whitespace-only input — the caller maps that to a
+/// usage (exit 2) error, not a DB error.
+fn fts5_match_query(query: &str) -> Result<String> {
+    let terms: Vec<String> = query
+        .split_whitespace()
+        .map(|t| format!("\"{}\"", t.replace('"', "\"\"")))
+        .collect();
+    if terms.is_empty() {
+        return Err(anyhow::anyhow!("empty search query"));
+    }
+    Ok(terms.join(" AND "))
+}
+
+/// FTS5 full-text search over stored messages.
+///
+/// The user query is sanitized by [`fts5_match_query`] — never bind raw
+/// input to `MATCH` directly.
 pub fn search_messages(
     conn: &Connection,
     query: &str,
     limit: i64,
 ) -> Result<Vec<crate::SearchHit>> {
+    let match_expr = fts5_match_query(query)?;
     let mut stmt = conn
         .prepare(
             r#"
@@ -552,7 +579,7 @@ pub fn search_messages(
         )
         .context("prepare search")?;
     let rows = stmt
-        .query_map(params![query, limit], |row| {
+        .query_map(params![match_expr, limit], |row| {
             Ok(crate::SearchHit {
                 id: row.get(0)?,
                 channel_id: row.get(1)?,
@@ -653,6 +680,41 @@ mod tests {
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].channel_name, "general");
         assert_eq!(hits[0].guild_name, "Test Guild");
+    }
+
+    #[test]
+    fn fts5_query_escapes_hostile_input() {
+        // FTS5 metacharacters must become literal terms, never syntax.
+        assert_eq!(fts5_match_query("hello").unwrap(), "\"hello\"");
+        assert_eq!(fts5_match_query("foo bar").unwrap(), "\"foo\" AND \"bar\"");
+        assert_eq!(fts5_match_query("foo\"bar").unwrap(), "\"foo\"\"bar\"");
+        assert_eq!(
+            fts5_match_query("AND OR NOT *").unwrap(),
+            "\"AND\" AND \"OR\" AND \"NOT\" AND \"*\""
+        );
+        assert_eq!(fts5_match_query("(unbalanced").unwrap(), "\"(unbalanced\"");
+        assert!(fts5_match_query("").is_err());
+        assert!(fts5_match_query("   \t ").is_err());
+    }
+
+    #[test]
+    fn search_messages_survives_malformed_fts_input() {
+        let conn = temp_db();
+        // Previously these crashed row iteration with `DbError "search row"`.
+        for q in [
+            "foo\"bar",
+            "AND",
+            "*",
+            "(",
+            ")",
+            "NEAR(",
+            "content:",
+            "\"unclosed",
+        ] {
+            // Must not panic/err — returns hits (likely empty) or a clean Err.
+            let _ = search_messages(&conn, q, 10);
+        }
+        assert!(search_messages(&conn, "", 10).is_err());
     }
 
     #[test]

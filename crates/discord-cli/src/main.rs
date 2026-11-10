@@ -903,6 +903,20 @@ fn main() -> ExitCode {
 async fn run() -> ExitCode {
     load_env();
     let cli = Cli::parse();
+    // Strict --format validation: unknown values must not silently fall back
+    // to auto-detect (resolve_format ignores unrecognized strings).
+    if let Some(f) = cli.format.as_deref() {
+        if !matches!(
+            f.trim().to_ascii_lowercase().as_str(),
+            "json" | "jsonl" | "yaml" | "rich" | "auto"
+        ) {
+            return ExitCode::from(output::emit_error(
+                "Usage",
+                &format!("invalid --format \"{f}\" (valid: json, jsonl, yaml, rich, auto)"),
+                exit::USAGE,
+            ));
+        }
+    }
     let format = output::resolve_format(cli.json, cli.yaml, cli.format.as_deref());
 
     // Reserved --tls-chrome: honest not-implemented (F9; review#9).
@@ -1163,7 +1177,7 @@ async fn run() -> ExitCode {
         }) => commands::local::cmd_export(&channel, json, output.as_deref(), format),
         Some(Command::Purge { channel, yes }) => commands::local::cmd_purge(&channel, yes, format),
         Some(Command::Auth { save, paste, qr }) => cmd_auth(save, paste, qr, format).await,
-        Some(Command::Serve) => cmd_serve().await,
+        Some(Command::Serve) => cmd_serve(&cli).await,
         Some(Command::ChannelCreate {
             guild,
             name,
@@ -1576,8 +1590,8 @@ async fn cmd_auth(save: bool, paste: bool, qr: bool, format: Format) -> ExitCode
 }
 
 /// `serve` — start the MCP server over stdio.
-async fn cmd_serve() -> ExitCode {
-    match discord_mcp::server::serve_stdio().await {
+async fn cmd_serve(cli: &Cli) -> ExitCode {
+    match discord_mcp::server::serve_stdio(cli.token.clone()).await {
         Ok(_) => ExitCode::from(exit::OK),
         Err(e) => ExitCode::from(output::emit_error("McpError", &e.to_string(), exit::ERROR)),
     }

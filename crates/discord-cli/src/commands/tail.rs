@@ -7,7 +7,41 @@ use std::process::ExitCode;
 
 use discord_core::output::{self, exit};
 
-use super::dc::DcCtx;
+use super::dc::{classify, DcCtx};
+
+/// REST auth preflight before opening the gateway.
+///
+/// The gateway auto-reconnects indefinitely (4004 auth failures are fatal
+/// per-close but the loop retries), so an invalid token would look "live"
+/// while silently dropping every event. `GET /users/@me` surfaces bad
+/// credentials immediately with a nonzero exit.
+async fn auth_preflight(token: &str) -> Result<(), ExitCode> {
+    let mut api = discord_core::client::ApiClient::with_token(token);
+    match api.get_me().await {
+        Ok(_) => Ok(()),
+        Err(e) => {
+            let is_auth = e.chain().any(|c| {
+                matches!(
+                    c.downcast_ref::<discord_user::DiscordError>(),
+                    Some(
+                        discord_user::DiscordError::InvalidToken
+                            | discord_user::DiscordError::AuthenticationFailed
+                    )
+                )
+            });
+            let (code, ec) = if is_auth {
+                ("AuthError", exit::ERROR)
+            } else {
+                ("ApiError", classify(&e))
+            };
+            Err(ExitCode::from(output::emit_error(
+                code,
+                &format!("token preflight failed: {e}"),
+                ec,
+            )))
+        }
+    }
+}
 
 /// Map the configured presence string to a gateway UserStatus.
 /// Defaults to Invisible (stealth posture; mrarfarf 3-layer coercion).
@@ -40,6 +74,10 @@ pub async fn dc_tail(ctx: &DcCtx, channel_id: &str, once: bool) -> ExitCode {
             Err(code) => return code,
         }
     };
+
+    if let Err(code) = auth_preflight(&token).await {
+        return code;
+    }
 
     let mut client = discord_user::DiscordUser::new(token.clone()).with_status(configured_status()); // stealth default invisible
 
@@ -101,6 +139,10 @@ pub async fn dc_watch(
             return ExitCode::from(output::emit_error("AuthError", &e.to_string(), exit::ERROR))
         }
     };
+
+    if let Err(code) = auth_preflight(&token).await {
+        return code;
+    }
 
     let mut client = discord_user::DiscordUser::new(token.clone()).with_status(configured_status());
 

@@ -526,8 +526,11 @@ pub async fn dc_read(
         Some(s) => match crate::commands::download::parse_since(s) {
             Some(t) => Some(crate::commands::download::time_to_snowflake(t)),
             None => {
-                eprintln!("invalid --since: \"{s}\" (use YYYY-MM-DD or 12h/30d/6m/1y)");
-                return ExitCode::from(exit::USAGE);
+                return ExitCode::from(output::emit_error(
+                    "Usage",
+                    &format!("invalid --since: \"{s}\" (use YYYY-MM-DD or 12h/30d/6m/1y)"),
+                    exit::USAGE,
+                ));
             }
         },
         None => None,
@@ -962,8 +965,31 @@ pub async fn dc_send(ctx: &DcCtx, channel: &str, opts: SendOpts<'_>) -> ExitCode
     } = opts;
     // Require text or at least one file.
     if text.is_none() && files.is_empty() {
-        eprintln!("nothing to send: provide --text (or --text -) and/or --file");
-        return ExitCode::from(exit::USAGE);
+        return ExitCode::from(output::emit_error(
+            "Usage",
+            "nothing to send: provide --text (or --text -) and/or --file",
+            exit::USAGE,
+        ));
+    }
+    // Local snowflake validation BEFORE any I/O — a bad --reply or
+    // --mention-roles id is a usage error, never a silent API 400.
+    if let Some(r) = reply {
+        if !is_numeric(r) {
+            return ExitCode::from(output::emit_error(
+                "Usage",
+                &format!("invalid --reply \"{r}\" (numeric message snowflake required)"),
+                exit::USAGE,
+            ));
+        }
+    }
+    for role in &mention_roles {
+        if !is_numeric(role) {
+            return ExitCode::from(output::emit_error(
+                "Usage",
+                &format!("invalid --mention-roles id \"{role}\" (numeric snowflake required)"),
+                exit::USAGE,
+            ));
+        }
     }
     // Safety (discli pattern): --confirm required for non-reply sends.
     if !confirm && reply.is_none() && !dry_run {
@@ -972,6 +998,16 @@ pub async fn dc_send(ctx: &DcCtx, channel: &str, opts: SendOpts<'_>) -> ExitCode
         );
         return ExitCode::from(exit::USAGE);
     }
+    // Resolve text FIRST — `--text -` reads stdin, and --dry-run must preview
+    // the real stdin content, not the literal "-".
+    let text = match text {
+        Some("-") => match read_stdin_text().await {
+            Ok(t) => t,
+            Err(code) => return code,
+        },
+        Some(t) => t.to_string(),
+        None => String::new(),
+    };
     // Discord message flags bitfield; SUPPRESS_EMBEDS = 4.
     let flags = if suppress_embeds { 4 } else { 0 };
     if dry_run {
@@ -992,15 +1028,6 @@ pub async fn dc_send(ctx: &DcCtx, channel: &str, opts: SendOpts<'_>) -> ExitCode
         return ExitCode::from(exit::OK);
     }
 
-    // Resolve text: "-" reads stdin (Escape-Tech send.js:10-17).
-    let text = match text {
-        Some("-") => match read_stdin_text().await {
-            Ok(t) => t,
-            Err(code) => return code,
-        },
-        Some(t) => t.to_string(),
-        None => String::new(),
-    };
     let attachments = match load_attachments(files).await {
         Ok(a) => a,
         Err(code) => return code,
@@ -1075,8 +1102,11 @@ pub async fn dc_join(ctx: &DcCtx, invite: &str, confirm: bool) -> ExitCode {
     let code = match ApiClient::extract_invite_code(invite) {
         Some(c) => c.to_string(),
         None => {
-            eprintln!("invalid invite: \"{invite}\"");
-            return ExitCode::from(exit::USAGE);
+            return ExitCode::from(output::emit_error(
+                "Usage",
+                &format!("invalid invite: \"{invite}\""),
+                exit::USAGE,
+            ));
         }
     };
     if !confirm {
@@ -1155,8 +1185,11 @@ pub async fn dc_presence(ctx: &DcCtx, status: Option<&str>) -> ExitCode {
         }
         Some(s) => {
             if !discord_core::config::set_configured_presence(s) {
-                eprintln!("invalid presence: \"{s}\" (valid: online, idle, dnd, invisible)");
-                return ExitCode::from(exit::USAGE);
+                return ExitCode::from(output::emit_error(
+                    "Usage",
+                    &format!("invalid presence: \"{s}\" (valid: online, idle, dnd, invisible)"),
+                    exit::USAGE,
+                ));
             }
             let data = serde_json::json!({ "presence": s, "saved": true });
             let _ = output::emit(&data, ctx.format);
@@ -1209,6 +1242,21 @@ pub async fn dc_thread_create(
     archive: Option<u32>,
     tags: Option<&str>,
 ) -> ExitCode {
+    if let Some(mid) = message_id {
+        if let Some(code) = snowflake_usage("message id", mid) {
+            return code;
+        }
+    }
+    // Discord only accepts these auto-archive durations (minutes).
+    if let Some(a) = archive {
+        if !matches!(a, 60 | 1440 | 4320 | 10080) {
+            return ExitCode::from(output::emit_error(
+                "Usage",
+                &format!("invalid --archive {a} (valid: 60, 1440, 4320, 10080)"),
+                exit::USAGE,
+            ));
+        }
+    }
     let mut client = match ctx.client().await {
         Ok(c) => c,
         Err(code) => return code,
@@ -1262,6 +1310,9 @@ pub async fn dc_thread_create(
 
 /// `dc edit <CHANNEL> <MSG_ID> --text ...`
 pub async fn dc_edit(ctx: &DcCtx, channel: &str, message_id: &str, text: &str) -> ExitCode {
+    if let Some(code) = snowflake_usage("message id", message_id) {
+        return code;
+    }
     let mut client = match ctx.client().await {
         Ok(c) => c,
         Err(code) => return code,
@@ -1282,6 +1333,9 @@ pub async fn dc_edit(ctx: &DcCtx, channel: &str, message_id: &str, text: &str) -
 
 /// `dc delete <CHANNEL> <MSG_ID> [--confirm]`
 pub async fn dc_delete(ctx: &DcCtx, channel: &str, message_id: &str, confirm: bool) -> ExitCode {
+    if let Some(code) = snowflake_usage("message id", message_id) {
+        return code;
+    }
     if !confirm {
         eprintln!(
             "This will delete message {message_id} in \"{channel}\". Add --confirm to proceed."
@@ -1308,6 +1362,16 @@ pub async fn dc_delete(ctx: &DcCtx, channel: &str, message_id: &str, confirm: bo
 
 /// `dc react <CHANNEL> <MSG> <EMOJI>`
 pub async fn dc_react(ctx: &DcCtx, channel: &str, message_id: &str, emoji: &str) -> ExitCode {
+    if let Some(code) = snowflake_usage("message id", message_id) {
+        return code;
+    }
+    if !valid_reaction_emoji(emoji) {
+        return ExitCode::from(output::emit_error(
+            "Usage",
+            &format!("invalid emoji \"{emoji}\" (unicode emoji, :name:, or name:id)"),
+            exit::USAGE,
+        ));
+    }
     let mut client = match ctx.client().await {
         Ok(c) => c,
         Err(code) => return code,
@@ -1327,6 +1391,16 @@ pub async fn dc_react(ctx: &DcCtx, channel: &str, message_id: &str, emoji: &str)
 
 /// `dc unreact <CHANNEL> <MSG> <EMOJI>`
 pub async fn dc_unreact(ctx: &DcCtx, channel: &str, message_id: &str, emoji: &str) -> ExitCode {
+    if let Some(code) = snowflake_usage("message id", message_id) {
+        return code;
+    }
+    if !valid_reaction_emoji(emoji) {
+        return ExitCode::from(output::emit_error(
+            "Usage",
+            &format!("invalid emoji \"{emoji}\" (unicode emoji, :name:, or name:id)"),
+            exit::USAGE,
+        ));
+    }
     let mut client = match ctx.client().await {
         Ok(c) => c,
         Err(code) => return code,
@@ -1346,6 +1420,9 @@ pub async fn dc_unreact(ctx: &DcCtx, channel: &str, message_id: &str, emoji: &st
 
 /// `dc pin <CHANNEL> <MSG>`
 pub async fn dc_pin(ctx: &DcCtx, channel: &str, message_id: &str) -> ExitCode {
+    if let Some(code) = snowflake_usage("message id", message_id) {
+        return code;
+    }
     let mut client = match ctx.client().await {
         Ok(c) => c,
         Err(code) => return code,
@@ -1630,6 +1707,49 @@ fn is_numeric(s: &str) -> bool {
     !s.is_empty() && s.chars().all(|c| c.is_ascii_digit())
 }
 
+/// Local snowflake validation for message/user/channel IDs — a bad ID is a
+/// usage error (exit 2) caught BEFORE any token lookup or network call,
+/// instead of a Discord 400 after resolution.
+fn snowflake_usage(field: &str, value: &str) -> Option<ExitCode> {
+    if is_numeric(value) {
+        None
+    } else {
+        Some(ExitCode::from(output::emit_error(
+            "Usage",
+            &format!("invalid {field} \"{value}\" (numeric snowflake required)"),
+            exit::USAGE,
+        )))
+    }
+}
+
+/// Sanity-check a reaction emoji before it is URL-encoded into the reaction
+/// endpoint: unicode emoji, `:name:`, or `name:id` custom-emoji form.
+/// Rejects empty strings, whitespace/control chars, and obvious non-emoji
+/// text like `not an emoji!!`.
+fn valid_reaction_emoji(emoji: &str) -> bool {
+    if emoji.is_empty()
+        || emoji.len() > 128
+        || emoji.chars().any(|c| c.is_control() || c.is_whitespace())
+    {
+        return false;
+    }
+    // `:name:` custom-emoji shortcode.
+    if let Some(inner) = emoji.strip_prefix(':').and_then(|s| s.strip_suffix(':')) {
+        return !inner.is_empty() && inner.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+    }
+    // `name:id` custom-emoji id form.
+    if let Some((name, id)) = emoji.split_once(':') {
+        return !name.is_empty()
+            && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+            && !id.is_empty()
+            && id.chars().all(|c| c.is_ascii_digit());
+    }
+    // Bare unicode emoji: must not contain ASCII letters/punctuation junk.
+    !emoji
+        .chars()
+        .any(|c| c.is_ascii_alphanumeric() || c == '!' || c == '?')
+}
+
 /// `channel-create <GUILD> <NAME> [--type T] [--category C] [--topic T]
 /// [--slowmode N] [--dry-run]`
 pub async fn dc_channel_create(ctx: &DcCtx, opts: ChannelCreateOpts<'_>) -> ExitCode {
@@ -1645,25 +1765,37 @@ pub async fn dc_channel_create(ctx: &DcCtx, opts: ChannelCreateOpts<'_>) -> Exit
     let ctype = match discord_core::types::parse_channel_type_name(channel_type) {
         Some(t) => t,
         None => {
-            eprintln!(
-                "invalid channel type \"{channel_type}\" (valid: text, voice, category, announcement, stage, forum)"
-            );
-            return ExitCode::from(exit::USAGE);
+            return ExitCode::from(output::emit_error(
+                "Usage",
+                &format!(
+                    "invalid channel type \"{channel_type}\" (valid: text, voice, category, announcement, stage, forum)"
+                ),
+                exit::USAGE,
+            ));
         }
     };
     if !ApiClient::validate_channel_name(name) {
-        eprintln!("invalid channel name \"{name}\" (1-100 chars, no '#')");
-        return ExitCode::from(exit::USAGE);
+        return ExitCode::from(output::emit_error(
+            "Usage",
+            &format!("invalid channel name \"{name}\" (1-100 chars, no '#')"),
+            exit::USAGE,
+        ));
     }
     if let Some(t) = topic {
         if !ApiClient::validate_topic(t) {
-            eprintln!("invalid topic (max 1024 chars)");
-            return ExitCode::from(exit::USAGE);
+            return ExitCode::from(output::emit_error(
+                "Usage",
+                "invalid topic (max 1024 chars)",
+                exit::USAGE,
+            ));
         }
     }
     if slowmode.is_some_and(|s| s > SLOWMODE_MAX) {
-        eprintln!("invalid slowmode {slowmode:?} (0-{SLOWMODE_MAX})");
-        return ExitCode::from(exit::USAGE);
+        return ExitCode::from(output::emit_error(
+            "Usage",
+            &format!("invalid slowmode {slowmode:?} (0-{SLOWMODE_MAX})"),
+            exit::USAGE,
+        ));
     }
     if dry_run {
         let data = serde_json::json!({
@@ -1690,8 +1822,11 @@ pub async fn dc_channel_create(ctx: &DcCtx, opts: ChannelCreateOpts<'_>) -> Exit
         Some(cat) => match resolve::resolve_category(&mut client, &guild_id, cat).await {
             Ok(Some(id)) => Some(id),
             Ok(None) => {
-                eprintln!("Category \"{cat}\" not found in guild {guild_id}.");
-                return ExitCode::from(exit::NOT_FOUND);
+                return ExitCode::from(output::emit_error(
+                    "NotFound",
+                    &format!("category \"{cat}\" not found in guild {guild_id}."),
+                    exit::NOT_FOUND,
+                ));
             }
             Err(code) => return code,
         },
@@ -1723,8 +1858,11 @@ pub async fn dc_channel_rename(
     dry_run: bool,
 ) -> ExitCode {
     if !ApiClient::validate_channel_name(new_name) {
-        eprintln!("invalid channel name \"{new_name}\" (1-100 chars, no '#')");
-        return ExitCode::from(exit::USAGE);
+        return ExitCode::from(output::emit_error(
+            "Usage",
+            &format!("invalid channel name \"{new_name}\" (1-100 chars, no '#')"),
+            exit::USAGE,
+        ));
     }
     let mut client = match ctx.client().await {
         Ok(c) => c,
@@ -1737,8 +1875,11 @@ pub async fn dc_channel_rename(
     let channel_id = match resolve::resolve_channel_admin(&mut client, &guild_id, channel).await {
         Ok(Some(id)) => id,
         Ok(None) => {
-            eprintln!("Channel \"{channel}\" not found in guild {guild_id}.");
-            return ExitCode::from(exit::NOT_FOUND);
+            return ExitCode::from(output::emit_error(
+                "NotFound",
+                &format!("channel \"{channel}\" not found in guild {guild_id}."),
+                exit::NOT_FOUND,
+            ));
         }
         Err(code) => return code,
     };
@@ -1770,8 +1911,11 @@ pub async fn dc_channel_rename(
 /// `channel-topic <GUILD> <CHANNEL> <TOPIC>`
 pub async fn dc_channel_topic(ctx: &DcCtx, guild: &str, channel: &str, topic: &str) -> ExitCode {
     if !ApiClient::validate_topic(topic) {
-        eprintln!("invalid topic (max 1024 chars)");
-        return ExitCode::from(exit::USAGE);
+        return ExitCode::from(output::emit_error(
+            "Usage",
+            "invalid topic (max 1024 chars)",
+            exit::USAGE,
+        ));
     }
     let mut client = match ctx.client().await {
         Ok(c) => c,
@@ -1784,8 +1928,11 @@ pub async fn dc_channel_topic(ctx: &DcCtx, guild: &str, channel: &str, topic: &s
     let channel_id = match resolve::resolve_channel_admin(&mut client, &guild_id, channel).await {
         Ok(Some(id)) => id,
         Ok(None) => {
-            eprintln!("Channel \"{channel}\" not found in guild {guild_id}.");
-            return ExitCode::from(exit::NOT_FOUND);
+            return ExitCode::from(output::emit_error(
+                "NotFound",
+                &format!("channel \"{channel}\" not found in guild {guild_id}."),
+                exit::NOT_FOUND,
+            ));
         }
         Err(code) => return code,
     };
@@ -1815,8 +1962,11 @@ pub async fn dc_channel_move(
     position: Option<u32>,
 ) -> ExitCode {
     if category.is_none() && position.is_none() {
-        eprintln!("channel-move requires --category and/or --position");
-        return ExitCode::from(exit::USAGE);
+        return ExitCode::from(output::emit_error(
+            "Usage",
+            "channel-move requires --category and/or --position",
+            exit::USAGE,
+        ));
     }
     let mut client = match ctx.client().await {
         Ok(c) => c,
@@ -1829,8 +1979,11 @@ pub async fn dc_channel_move(
     let channel_id = match resolve::resolve_channel_admin(&mut client, &guild_id, channel).await {
         Ok(Some(id)) => id,
         Ok(None) => {
-            eprintln!("Channel \"{channel}\" not found in guild {guild_id}.");
-            return ExitCode::from(exit::NOT_FOUND);
+            return ExitCode::from(output::emit_error(
+                "NotFound",
+                &format!("channel \"{channel}\" not found in guild {guild_id}."),
+                exit::NOT_FOUND,
+            ));
         }
         Err(code) => return code,
     };
@@ -1838,8 +1991,11 @@ pub async fn dc_channel_move(
         Some(cat) => match resolve::resolve_category(&mut client, &guild_id, cat).await {
             Ok(Some(id)) => Some(id),
             Ok(None) => {
-                eprintln!("Category \"{cat}\" not found in guild {guild_id}.");
-                return ExitCode::from(exit::NOT_FOUND);
+                return ExitCode::from(output::emit_error(
+                    "NotFound",
+                    &format!("category \"{cat}\" not found in guild {guild_id}."),
+                    exit::NOT_FOUND,
+                ));
             }
             Err(code) => return code,
         },
@@ -1881,8 +2037,11 @@ pub async fn dc_channel_clone(
     let channel_id = match resolve::resolve_channel_admin(&mut client, &guild_id, channel).await {
         Ok(Some(id)) => id,
         Ok(None) => {
-            eprintln!("Channel \"{channel}\" not found in guild {guild_id}.");
-            return ExitCode::from(exit::NOT_FOUND);
+            return ExitCode::from(output::emit_error(
+                "NotFound",
+                &format!("channel \"{channel}\" not found in guild {guild_id}."),
+                exit::NOT_FOUND,
+            ));
         }
         Err(code) => return code,
     };
@@ -1905,8 +2064,11 @@ pub async fn dc_channel_clone(
         }
     };
     if !ApiClient::validate_channel_name(&clone_name) {
-        eprintln!("invalid channel name \"{clone_name}\" (1-100 chars, no '#')");
-        return ExitCode::from(exit::USAGE);
+        return ExitCode::from(output::emit_error(
+            "Usage",
+            &format!("invalid channel name \"{clone_name}\" (1-100 chars, no '#')"),
+            exit::USAGE,
+        ));
     }
     let mut req = discord_user::types::CreateChannelRequest::new(&clone_name);
     req.channel_type = Some(original.channel_type);
@@ -1932,8 +2094,11 @@ pub async fn dc_channel_slowmode(
     seconds: u64,
 ) -> ExitCode {
     if seconds > SLOWMODE_MAX {
-        eprintln!("invalid slowmode {seconds} (0-{SLOWMODE_MAX})");
-        return ExitCode::from(exit::USAGE);
+        return ExitCode::from(output::emit_error(
+            "Usage",
+            &format!("invalid slowmode {seconds} (0-{SLOWMODE_MAX})"),
+            exit::USAGE,
+        ));
     }
     let mut client = match ctx.client().await {
         Ok(c) => c,
@@ -1946,8 +2111,11 @@ pub async fn dc_channel_slowmode(
     let channel_id = match resolve::resolve_channel_admin(&mut client, &guild_id, channel).await {
         Ok(Some(id)) => id,
         Ok(None) => {
-            eprintln!("Channel \"{channel}\" not found in guild {guild_id}.");
-            return ExitCode::from(exit::NOT_FOUND);
+            return ExitCode::from(output::emit_error(
+                "NotFound",
+                &format!("channel \"{channel}\" not found in guild {guild_id}."),
+                exit::NOT_FOUND,
+            ));
         }
         Err(code) => return code,
     };
@@ -1983,8 +2151,11 @@ pub async fn dc_channel_delete(ctx: &DcCtx, guild: &str, channel: &str, confirm:
     let channel_id = match resolve::resolve_channel_admin(&mut client, &guild_id, channel).await {
         Ok(Some(id)) => id,
         Ok(None) => {
-            eprintln!("Channel \"{channel}\" not found in guild {guild_id}.");
-            return ExitCode::from(exit::NOT_FOUND);
+            return ExitCode::from(output::emit_error(
+                "NotFound",
+                &format!("channel \"{channel}\" not found in guild {guild_id}."),
+                exit::NOT_FOUND,
+            ));
         }
         Err(code) => return code,
     };
@@ -2018,15 +2189,17 @@ pub async fn dc_role_create(ctx: &DcCtx, opts: RoleCreateOpts<'_>) -> ExitCode {
         .trim_start_matches('@')
         .eq_ignore_ascii_case("everyone")
     {
-        eprintln!("cannot create the @everyone role");
-        return ExitCode::from(exit::USAGE);
+        return ExitCode::from(output::emit_error(
+            "Usage",
+            "cannot create the @everyone role",
+            exit::USAGE,
+        ));
     }
     let color_val = match color {
         Some(c) => match ApiClient::parse_color_hex(c) {
             Ok(v) => Some(v),
             Err(e) => {
-                eprintln!("{e}");
-                return ExitCode::from(exit::USAGE);
+                return ExitCode::from(output::emit_error("Usage", &e.to_string(), exit::USAGE));
             }
         },
         None => None,
@@ -2037,8 +2210,11 @@ pub async fn dc_role_create(ctx: &DcCtx, opts: RoleCreateOpts<'_>) -> ExitCode {
             match ApiClient::parse_permission_names(&names) {
                 Ok(bits) => Some(bits.to_string()),
                 Err(e) => {
-                    eprintln!("{e}");
-                    return ExitCode::from(exit::USAGE);
+                    return ExitCode::from(output::emit_error(
+                        "Usage",
+                        &e.to_string(),
+                        exit::USAGE,
+                    ));
                 }
             }
         }
@@ -2104,17 +2280,17 @@ pub async fn dc_role_edit(ctx: &DcCtx, opts: RoleEditOpts<'_>) -> ExitCode {
         && mentionable.is_none()
         && hoist.is_none()
     {
-        eprintln!(
-            "role-edit requires at least one option (--name, --color, --permissions, --mentionable, --hoist)"
-        );
-        return ExitCode::from(exit::USAGE);
+        return ExitCode::from(output::emit_error(
+            "Usage",
+            "role-edit requires at least one option (--name, --color, --permissions, --mentionable, --hoist)",
+            exit::USAGE,
+        ));
     }
     let color_val = match color {
         Some(c) => match ApiClient::parse_color_hex(c) {
             Ok(v) => Some(v),
             Err(e) => {
-                eprintln!("{e}");
-                return ExitCode::from(exit::USAGE);
+                return ExitCode::from(output::emit_error("Usage", &e.to_string(), exit::USAGE));
             }
         },
         None => None,
@@ -2125,8 +2301,11 @@ pub async fn dc_role_edit(ctx: &DcCtx, opts: RoleEditOpts<'_>) -> ExitCode {
             match ApiClient::parse_permission_names(&names) {
                 Ok(bits) => Some(bits.to_string()),
                 Err(e) => {
-                    eprintln!("{e}");
-                    return ExitCode::from(exit::USAGE);
+                    return ExitCode::from(output::emit_error(
+                        "Usage",
+                        &e.to_string(),
+                        exit::USAGE,
+                    ));
                 }
             }
         }
@@ -2143,8 +2322,11 @@ pub async fn dc_role_edit(ctx: &DcCtx, opts: RoleEditOpts<'_>) -> ExitCode {
     let role_id = match resolve::resolve_role(&mut client, &guild_id, role).await {
         Ok(Some(id)) => id,
         Ok(None) => {
-            eprintln!("Role \"{role}\" not found in guild {guild_id}.");
-            return ExitCode::from(exit::NOT_FOUND);
+            return ExitCode::from(output::emit_error(
+                "NotFound",
+                &format!("role \"{role}\" not found in guild {guild_id}."),
+                exit::NOT_FOUND,
+            ));
         }
         Err(code) => return code,
     };
@@ -2185,15 +2367,21 @@ pub async fn dc_role_delete(ctx: &DcCtx, guild: &str, role: &str, confirm: bool)
     // Offline @everyone guard: the @everyone role shares the guild's ID, so
     // targeting a numeric guild ID as the role is always a refusal (exit 2).
     if is_numeric(guild) && guild == role {
-        eprintln!("cannot delete the @everyone role");
-        return ExitCode::from(exit::USAGE);
+        return ExitCode::from(output::emit_error(
+            "Usage",
+            "cannot delete the @everyone role",
+            exit::USAGE,
+        ));
     }
     if role
         .trim_start_matches('@')
         .eq_ignore_ascii_case("everyone")
     {
-        eprintln!("cannot delete the @everyone role");
-        return ExitCode::from(exit::USAGE);
+        return ExitCode::from(output::emit_error(
+            "Usage",
+            "cannot delete the @everyone role",
+            exit::USAGE,
+        ));
     }
     // Destructive gate BEFORE any network (offline smoke-testable).
     if let Some(code) = check_confirm(role, "delete role", role, confirm) {
@@ -2210,8 +2398,11 @@ pub async fn dc_role_delete(ctx: &DcCtx, guild: &str, role: &str, confirm: bool)
     let role_id = match resolve::resolve_role(&mut client, &guild_id, role).await {
         Ok(Some(id)) => id,
         Ok(None) => {
-            eprintln!("Role \"{role}\" not found in guild {guild_id}.");
-            return ExitCode::from(exit::NOT_FOUND);
+            return ExitCode::from(output::emit_error(
+                "NotFound",
+                &format!("role \"{role}\" not found in guild {guild_id}."),
+                exit::NOT_FOUND,
+            ));
         }
         Err(code) => return code,
     };
@@ -2241,16 +2432,22 @@ pub async fn dc_role_assign(ctx: &DcCtx, guild: &str, role: &str, user: &str) ->
     let role_id = match resolve::resolve_role(&mut client, &guild_id, role).await {
         Ok(Some(id)) => id,
         Ok(None) => {
-            eprintln!("Role \"{role}\" not found in guild {guild_id}.");
-            return ExitCode::from(exit::NOT_FOUND);
+            return ExitCode::from(output::emit_error(
+                "NotFound",
+                &format!("role \"{role}\" not found in guild {guild_id}."),
+                exit::NOT_FOUND,
+            ));
         }
         Err(code) => return code,
     };
     let user_id = match resolve::resolve_member(&mut client, &guild_id, user).await {
         Ok(Some(id)) => id,
         Ok(None) => {
-            eprintln!("Member \"{user}\" not found in guild {guild_id}.");
-            return ExitCode::from(exit::NOT_FOUND);
+            return ExitCode::from(output::emit_error(
+                "NotFound",
+                &format!("member \"{user}\" not found in guild {guild_id}."),
+                exit::NOT_FOUND,
+            ));
         }
         Err(code) => return code,
     };
@@ -2285,16 +2482,22 @@ pub async fn dc_role_remove(ctx: &DcCtx, guild: &str, role: &str, user: &str) ->
     let role_id = match resolve::resolve_role(&mut client, &guild_id, role).await {
         Ok(Some(id)) => id,
         Ok(None) => {
-            eprintln!("Role \"{role}\" not found in guild {guild_id}.");
-            return ExitCode::from(exit::NOT_FOUND);
+            return ExitCode::from(output::emit_error(
+                "NotFound",
+                &format!("role \"{role}\" not found in guild {guild_id}."),
+                exit::NOT_FOUND,
+            ));
         }
         Err(code) => return code,
     };
     let user_id = match resolve::resolve_member(&mut client, &guild_id, user).await {
         Ok(Some(id)) => id,
         Ok(None) => {
-            eprintln!("Member \"{user}\" not found in guild {guild_id}.");
-            return ExitCode::from(exit::NOT_FOUND);
+            return ExitCode::from(output::emit_error(
+                "NotFound",
+                &format!("member \"{user}\" not found in guild {guild_id}."),
+                exit::NOT_FOUND,
+            ));
         }
         Err(code) => return code,
     };
@@ -2349,8 +2552,11 @@ pub async fn dc_emoji_list(ctx: &DcCtx, guild: &str, count: Option<u32>) -> Exit
 /// Name and file checks run BEFORE client creation so they work offline.
 pub async fn dc_emoji_upload(ctx: &DcCtx, guild: &str, name: &str, file: &str) -> ExitCode {
     if !ApiClient::validate_emoji_name(name) {
-        eprintln!("invalid emoji name \"{name}\" (alphanumeric + underscore, 2-32 chars)");
-        return ExitCode::from(exit::USAGE);
+        return ExitCode::from(output::emit_error(
+            "Usage",
+            &format!("invalid emoji name \"{name}\" (alphanumeric + underscore, 2-32 chars)"),
+            exit::USAGE,
+        ));
     }
     // Offline file gate: missing or oversized → exit 7 (EXIT_ATTACHMENT).
     let size = match tokio::fs::metadata(file).await {
@@ -2361,11 +2567,14 @@ pub async fn dc_emoji_upload(ctx: &DcCtx, guild: &str, name: &str, file: &str) -
         }
     };
     if size > ApiClient::MAX_EMOJI_SIZE {
-        eprintln!(
-            "file too large ({} bytes max for an emoji): {file}",
-            ApiClient::MAX_EMOJI_SIZE
-        );
-        return ExitCode::from(EXIT_ATTACHMENT);
+        return ExitCode::from(output::emit_error(
+            "AttachmentError",
+            &format!(
+                "file too large ({} bytes max for an emoji): {file}",
+                ApiClient::MAX_EMOJI_SIZE
+            ),
+            EXIT_ATTACHMENT,
+        ));
     }
     let mut client = match ctx.client().await {
         Ok(c) => c,
@@ -2408,17 +2617,23 @@ pub async fn dc_emoji_delete(ctx: &DcCtx, guild: &str, emoji: &str, confirm: boo
     let emoji = match resolve::resolve_emoji(&mut client, &guild_id, emoji).await {
         Ok(Some(e)) => e,
         Ok(None) => {
-            eprintln!("Emoji \"{emoji}\" not found in guild {guild_id}.");
-            return ExitCode::from(exit::NOT_FOUND);
+            return ExitCode::from(output::emit_error(
+                "NotFound",
+                &format!("emoji \"{emoji}\" not found in guild {guild_id}."),
+                exit::NOT_FOUND,
+            ));
         }
         Err(code) => return code,
     };
     if emoji.managed {
-        eprintln!(
-            "cannot delete managed emoji :{}: (owned by a bot/integration)",
-            emoji.name.clone().unwrap_or_default()
-        );
-        return ExitCode::from(exit::ERROR);
+        return ExitCode::from(output::emit_error(
+            "Forbidden",
+            &format!(
+                "cannot delete managed emoji :{}: (owned by a bot/integration)",
+                emoji.name.clone().unwrap_or_default()
+            ),
+            exit::FORBIDDEN,
+        ));
     }
     match client.delete_emoji(&guild_id, &emoji.id).await {
         Ok(()) => {
@@ -2456,8 +2671,11 @@ async fn resolve_user_id(
         match resolve::resolve_member(client, guild_id, user).await {
             Ok(Some(id)) => return Ok(id),
             Ok(None) => {
-                eprintln!("Member \"{user}\" not found in guild {guild_id}.");
-                return Err(ExitCode::from(exit::NOT_FOUND));
+                return Err(ExitCode::from(output::emit_error(
+                    "NotFound",
+                    &format!("member \"{user}\" not found in guild {guild_id}."),
+                    exit::NOT_FOUND,
+                )));
             }
             Err(code) => return Err(code),
         }
@@ -2475,20 +2693,23 @@ async fn resolve_user_id(
                 .collect();
             match matches.len() {
                 1 => Ok(matches[0].user_id.clone()),
-                n if n > 1 => {
-                    eprintln!("Ambiguous user \"{user}\". Matches: {n}");
-                    Err(ExitCode::from(exit::USAGE))
-                }
-                _ => {
-                    eprintln!("User \"{user}\" not found (bare ID or friend username required).");
-                    Err(ExitCode::from(exit::NOT_FOUND))
-                }
+                n if n > 1 => Err(ExitCode::from(output::emit_error(
+                    "Usage",
+                    &format!("ambiguous user \"{user}\". {n} matches — use the user ID."),
+                    exit::USAGE,
+                ))),
+                _ => Err(ExitCode::from(output::emit_error(
+                    "NotFound",
+                    "user not found (bare ID or friend username required).",
+                    exit::NOT_FOUND,
+                ))),
             }
         }
-        Err(e) => {
-            eprintln!("error: {e}");
-            Err(ExitCode::from(exit::ERROR))
-        }
+        Err(e) => Err(ExitCode::from(output::emit_error(
+            "ApiError",
+            &e.to_string(),
+            classify(&e),
+        ))),
     }
 }
 
@@ -2559,8 +2780,11 @@ pub async fn dc_member_ban(
     }
     // --delete-days validated 0-7.
     if delete_days.is_some_and(|d| d > 7) {
-        eprintln!("invalid --delete-days {} (0-7)", delete_days.unwrap());
-        return ExitCode::from(exit::USAGE);
+        return ExitCode::from(output::emit_error(
+            "Usage",
+            &format!("invalid --delete-days {} (0-7)", delete_days.unwrap()),
+            exit::USAGE,
+        ));
     }
     let mut client = match ctx.client().await {
         Ok(c) => c,
@@ -2680,8 +2904,11 @@ pub async fn dc_perm_view(ctx: &DcCtx, guild: &str, channel: &str) -> ExitCode {
     let channel_id = match resolve::resolve_channel_admin(&mut client, &guild_id, channel).await {
         Ok(Some(id)) => id,
         Ok(None) => {
-            eprintln!("Channel \"{channel}\" not found in guild {guild_id}.");
-            return ExitCode::from(exit::NOT_FOUND);
+            return ExitCode::from(output::emit_error(
+                "NotFound",
+                &format!("channel \"{channel}\" not found in guild {guild_id}."),
+                exit::NOT_FOUND,
+            ));
         }
         Err(code) => return code,
     };
@@ -2759,15 +2986,17 @@ pub async fn dc_perm_set(
     deny: Option<&str>,
 ) -> ExitCode {
     if allow.is_none() && deny.is_none() {
-        eprintln!("perm-set requires --allow and/or --deny");
-        return ExitCode::from(exit::USAGE);
+        return ExitCode::from(output::emit_error(
+            "Usage",
+            "perm-set requires --allow and/or --deny",
+            exit::USAGE,
+        ));
     }
     let allow_bits = match allow {
         Some(a) => match ApiClient::parse_permission_names(&parse_csv(a)) {
             Ok(b) => b,
             Err(e) => {
-                eprintln!("{e}");
-                return ExitCode::from(exit::USAGE);
+                return ExitCode::from(output::emit_error("Usage", &e.to_string(), exit::USAGE));
             }
         },
         None => 0,
@@ -2776,8 +3005,7 @@ pub async fn dc_perm_set(
         Some(d) => match ApiClient::parse_permission_names(&parse_csv(d)) {
             Ok(b) => b,
             Err(e) => {
-                eprintln!("{e}");
-                return ExitCode::from(exit::USAGE);
+                return ExitCode::from(output::emit_error("Usage", &e.to_string(), exit::USAGE));
             }
         },
         None => 0,
@@ -2793,16 +3021,22 @@ pub async fn dc_perm_set(
     let channel_id = match resolve::resolve_channel_admin(&mut client, &guild_id, channel).await {
         Ok(Some(id)) => id,
         Ok(None) => {
-            eprintln!("Channel \"{channel}\" not found in guild {guild_id}.");
-            return ExitCode::from(exit::NOT_FOUND);
+            return ExitCode::from(output::emit_error(
+                "NotFound",
+                &format!("channel \"{channel}\" not found in guild {guild_id}."),
+                exit::NOT_FOUND,
+            ));
         }
         Err(code) => return code,
     };
     let role_id = match resolve::resolve_role(&mut client, &guild_id, role).await {
         Ok(Some(id)) => id,
         Ok(None) => {
-            eprintln!("Role \"{role}\" not found in guild {guild_id}.");
-            return ExitCode::from(exit::NOT_FOUND);
+            return ExitCode::from(output::emit_error(
+                "NotFound",
+                &format!("role \"{role}\" not found in guild {guild_id}."),
+                exit::NOT_FOUND,
+            ));
         }
         Err(code) => return code,
     };
@@ -2866,8 +3100,11 @@ pub async fn dc_perm_lock(
     let channel_id = match resolve::resolve_channel_admin(&mut client, &guild_id, channel).await {
         Ok(Some(id)) => id,
         Ok(None) => {
-            eprintln!("Channel \"{channel}\" not found in guild {guild_id}.");
-            return ExitCode::from(exit::NOT_FOUND);
+            return ExitCode::from(output::emit_error(
+                "NotFound",
+                &format!("channel \"{channel}\" not found in guild {guild_id}."),
+                exit::NOT_FOUND,
+            ));
         }
         Err(code) => return code,
     };
@@ -2902,8 +3139,11 @@ pub async fn dc_perm_unlock(ctx: &DcCtx, guild: &str, channel: &str, confirm: bo
     let channel_id = match resolve::resolve_channel_admin(&mut client, &guild_id, channel).await {
         Ok(Some(id)) => id,
         Ok(None) => {
-            eprintln!("Channel \"{channel}\" not found in guild {guild_id}.");
-            return ExitCode::from(exit::NOT_FOUND);
+            return ExitCode::from(output::emit_error(
+                "NotFound",
+                &format!("channel \"{channel}\" not found in guild {guild_id}."),
+                exit::NOT_FOUND,
+            ));
         }
         Err(code) => return code,
     };
@@ -2977,30 +3217,40 @@ pub async fn dc_server_set(ctx: &DcCtx, opts: ServerSetOpts<'_>) -> ExitCode {
         && system_channel.is_none()
         && rules_channel.is_none()
     {
-        eprintln!(
-            "server-set requires at least one option (--name, --description, --verification, --notifications, --content-filter, --afk-timeout, --system-channel, --rules-channel)"
-        );
-        return ExitCode::from(exit::USAGE);
+        return ExitCode::from(output::emit_error(
+            "Usage",
+            "server-set requires at least one option (--name, --description, --verification, --notifications, --content-filter, --afk-timeout, --system-channel, --rules-channel)",
+            exit::USAGE,
+        ));
     }
     if let Some(n) = name {
         let len = n.chars().count();
         if !(2..=100).contains(&len) {
-            eprintln!("invalid server name (2-100 chars)");
-            return ExitCode::from(exit::USAGE);
+            return ExitCode::from(output::emit_error(
+                "Usage",
+                "invalid server name (2-100 chars)",
+                exit::USAGE,
+            ));
         }
     }
     if let Some(d) = description {
         if d.chars().count() > 120 {
-            eprintln!("invalid description (max 120 chars)");
-            return ExitCode::from(exit::USAGE);
+            return ExitCode::from(output::emit_error(
+                "Usage",
+                "invalid description (max 120 chars)",
+                exit::USAGE,
+            ));
         }
     }
     let verification_val = match verification {
         Some(v) => match discord_core::types::parse_verification_level(v) {
             Some(l) => Some(l),
             None => {
-                eprintln!("invalid --verification \"{v}\" (none|low|medium|high|very_high)");
-                return ExitCode::from(exit::USAGE);
+                return ExitCode::from(output::emit_error(
+                    "Usage",
+                    &format!("invalid --verification \"{v}\" (none|low|medium|high|very_high)"),
+                    exit::USAGE,
+                ));
             }
         },
         None => None,
@@ -3009,8 +3259,11 @@ pub async fn dc_server_set(ctx: &DcCtx, opts: ServerSetOpts<'_>) -> ExitCode {
         Some(n) => match discord_core::types::parse_notification_level(n) {
             Some(l) => Some(l),
             None => {
-                eprintln!("invalid --notifications \"{n}\" (all_messages|only_mentions)");
-                return ExitCode::from(exit::USAGE);
+                return ExitCode::from(output::emit_error(
+                    "Usage",
+                    &format!("invalid --notifications \"{n}\" (all_messages|only_mentions)"),
+                    exit::USAGE,
+                ));
             }
         },
         None => None,
@@ -3019,18 +3272,24 @@ pub async fn dc_server_set(ctx: &DcCtx, opts: ServerSetOpts<'_>) -> ExitCode {
         Some(c) => match discord_core::types::parse_content_filter(c) {
             Some(l) => Some(l),
             None => {
-                eprintln!(
-                    "invalid --content-filter \"{c}\" (disabled|members_without_roles|all_members)"
-                );
-                return ExitCode::from(exit::USAGE);
+                return ExitCode::from(output::emit_error(
+                    "Usage",
+                    &format!(
+                        "invalid --content-filter \"{c}\" (disabled|members_without_roles|all_members)"
+                    ),
+                    exit::USAGE,
+                ));
             }
         },
         None => None,
     };
     if let Some(t) = afk_timeout {
         if !matches!(t, 60 | 300 | 900 | 1800 | 3600) {
-            eprintln!("invalid --afk-timeout {t} (60|300|900|1800|3600)");
-            return ExitCode::from(exit::USAGE);
+            return ExitCode::from(output::emit_error(
+                "Usage",
+                &format!("invalid --afk-timeout {t} (60|300|900|1800|3600)"),
+                exit::USAGE,
+            ));
         }
     }
     let req = discord_user::types::EditGuildRequest {
@@ -3099,8 +3358,11 @@ pub async fn dc_server_icon(ctx: &DcCtx, guild: &str, file: &str) -> ExitCode {
         Err(e) => {
             // File size/type errors surface as exit 7; API errors via classify.
             if format!("{e}").contains("too large") || format!("{e}").contains("unsupported") {
-                eprintln!("{e}");
-                return ExitCode::from(EXIT_ATTACHMENT);
+                return ExitCode::from(output::emit_error(
+                    "AttachmentError",
+                    &e.to_string(),
+                    EXIT_ATTACHMENT,
+                ));
             }
             let code = classify(&e);
             ExitCode::from(output::emit_error("ApiError", &e.to_string(), code))
@@ -3125,8 +3387,7 @@ pub async fn dc_audit_log(
         Some(k) => match discord_core::types::audit_action_code(k) {
             Ok(code) => Some(code),
             Err(e) => {
-                eprintln!("{e}");
-                return ExitCode::from(exit::USAGE);
+                return ExitCode::from(output::emit_error("Usage", &e.to_string(), exit::USAGE));
             }
         },
         None => None,
@@ -3135,8 +3396,11 @@ pub async fn dc_audit_log(
         Some(u) => match u.parse::<u64>() {
             Ok(id) => Some(id),
             Err(_) => {
-                eprintln!("invalid --user \"{u}\" (audit user is a numeric ID)");
-                return ExitCode::from(exit::USAGE);
+                return ExitCode::from(output::emit_error(
+                    "Usage",
+                    &format!("invalid --user \"{u}\" (audit user is a numeric ID)"),
+                    exit::USAGE,
+                ));
             }
         },
         None => None,
@@ -3430,8 +3694,7 @@ pub async fn dc_embed(ctx: &DcCtx, opts: EmbedOpts<'_>) -> ExitCode {
         match parse_embed_field(raw) {
             Ok(f) => spec_fields.push(f),
             Err(e) => {
-                eprintln!("{e}");
-                return ExitCode::from(exit::USAGE);
+                return ExitCode::from(output::emit_error("Usage", &e.to_string(), exit::USAGE));
             }
         }
     }
@@ -3440,8 +3703,7 @@ pub async fn dc_embed(ctx: &DcCtx, opts: EmbedOpts<'_>) -> ExitCode {
         Some(c) => match ApiClient::parse_color_hex(c) {
             Ok(v) => Some(v),
             Err(e) => {
-                eprintln!("{e}");
-                return ExitCode::from(exit::USAGE);
+                return ExitCode::from(output::emit_error("Usage", &e.to_string(), exit::USAGE));
             }
         },
         None => None,
@@ -3461,8 +3723,7 @@ pub async fn dc_embed(ctx: &DcCtx, opts: EmbedOpts<'_>) -> ExitCode {
     };
     // Validate embed limits (offline; exit 2 on violation).
     if let Err(e) = discord_core::types::validate_embed(&spec) {
-        eprintln!("{e}");
-        return ExitCode::from(exit::USAGE);
+        return ExitCode::from(output::emit_error("Usage", &e.to_string(), exit::USAGE));
     }
     // Dry-run preview BEFORE any network.
     if dry_run {
