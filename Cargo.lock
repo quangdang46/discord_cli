@@ -511,11 +511,13 @@ dependencies = [
  "discord-db",
  "discord-mcp",
  "discord-user-rs",
+ "futures-util",
  "md-5",
  "mime_guess",
  "reqwest",
  "serde_json",
  "tokio",
+ "url",
 ]
 
 [[package]]
@@ -543,6 +545,7 @@ name = "discord-db"
 version = "0.1.3"
 dependencies = [
  "anyhow",
+ "chrono",
  "rusqlite",
  "serde",
 ]

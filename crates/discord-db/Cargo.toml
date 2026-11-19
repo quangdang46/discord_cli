@@ -9,3 +9,4 @@ description = "SQLite archive: schema, FTS5 search, two-phase sync state"
 serde.workspace = true
 rusqlite.workspace = true
 anyhow.workspace = true
+chrono.workspace = true

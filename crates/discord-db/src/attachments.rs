@@ -49,25 +49,47 @@ pub struct NewAttachment {
     pub size: Option<i64>,
 }
 
+const UPSERT_ATTACHMENT_SQL: &str = r#"
+    INSERT OR IGNORE INTO attachments
+        (id, message_id, channel_id, url, filename, content_type, size)
+    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+    "#;
+
+fn upsert_attachment_with(stmt: &mut rusqlite::Statement<'_>, a: &NewAttachment) -> Result<()> {
+    stmt.execute(params![
+        a.id,
+        a.message_id,
+        a.channel_id,
+        a.url,
+        a.filename,
+        a.content_type,
+        a.size
+    ])
+    .context("upsert attachment")?;
+    Ok(())
+}
+
 /// Insert an attachment row (INSERT OR IGNORE — idempotent).
 pub fn upsert_attachment(conn: &Connection, a: &NewAttachment) -> Result<()> {
-    conn.execute(
-        r#"
-        INSERT OR IGNORE INTO attachments
-            (id, message_id, channel_id, url, filename, content_type, size)
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-        "#,
-        params![
-            a.id,
-            a.message_id,
-            a.channel_id,
-            a.url,
-            a.filename,
-            a.content_type,
-            a.size
-        ],
-    )
-    .context("upsert attachment")?;
+    let mut stmt = conn
+        .prepare(UPSERT_ATTACHMENT_SQL)
+        .context("prepare upsert attachment")?;
+    upsert_attachment_with(&mut stmt, a)
+}
+
+/// Batch variant: prepares the statement ONCE and loops — rusqlite
+/// `execute` re-prepares per call, which dominated sync runs with many
+/// attachments per channel.
+pub fn upsert_attachments(conn: &Connection, rows: &[NewAttachment]) -> Result<()> {
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let mut stmt = conn
+        .prepare(UPSERT_ATTACHMENT_SQL)
+        .context("prepare upsert attachments")?;
+    for a in rows {
+        upsert_attachment_with(&mut stmt, a)?;
+    }
     Ok(())
 }
 
@@ -149,6 +171,23 @@ pub fn mark_downloaded(conn: &Connection, id: &str, local_path: &str) -> Result<
         params![local_path, id],
     )
     .context("mark attachment downloaded")?;
+    Ok(())
+}
+
+/// Batch variant of [`mark_downloaded`]: one prepared statement for the
+/// whole download run instead of a prepare per file.
+/// `marks` is `(attachment_id, local_path)` pairs.
+pub fn mark_downloaded_batch(conn: &Connection, marks: &[(String, String)]) -> Result<()> {
+    if marks.is_empty() {
+        return Ok(());
+    }
+    let mut stmt = conn
+        .prepare("UPDATE attachments SET local_path = ?1 WHERE id = ?2")
+        .context("prepare mark_downloaded batch")?;
+    for (id, path) in marks {
+        stmt.execute(params![path, id])
+            .context("mark attachment downloaded")?;
+    }
     Ok(())
 }
 

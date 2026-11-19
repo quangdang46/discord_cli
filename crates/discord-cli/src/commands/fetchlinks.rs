@@ -117,52 +117,59 @@ fn is_direct_image_url(raw_url: &str) -> bool {
 /// residual gap (rebinding) — the proxy path delegates fetching to Discord
 /// and is unaffected.
 fn host_is_public(raw_url: &str) -> bool {
-    let Some(host) = host_of(raw_url) else {
+    // Parse with the WHATWG URL parser first: it normalizes non-canonical
+    // IP spellings — `127.1`, `2130706433`, `0x7f000001`, `0177.0.0.1` —
+    // into `Host::Ipv4`, which `Ipv4Addr::from_str` on the raw host string
+    // misses entirely (they'd fall through to the "hostname" allow branch
+    // and connect to loopback: SSRF bypass).
+    let Ok(parsed) = url::Url::parse(raw_url) else {
         return false;
     };
-    let h = host.trim_end_matches('.');
-    if h == "localhost"
-        || h.ends_with(".localhost")
-        || h.ends_with(".local")
-        || h.ends_with(".internal")
-        || h.ends_with(".lan")
-        || h.ends_with(".home")
-        || h.ends_with(".corp")
-    {
+    let Some(host) = parsed.host() else {
         return false;
-    }
-    if let Ok(ip) = h.parse::<std::net::Ipv4Addr>() {
-        let o = ip.octets();
-        // 0/8, 10/8, 100.64/10 (CGNAT), 127/8, 169.254/16, 172.16/12,
-        // 192.0.0/24 + 192.0.2/24 (IETF protocol assignments + TEST-NET-1),
-        // 192.168/16, 198.18/15 (benchmark), 198.51.100/24 + 203.0.113/24
-        // (TEST-NET-2/3), 224/4 multicast, 240/4 reserved.
-        let blocked = o[0] == 0
-            || o[0] == 10
-            || o[0] == 127
-            || (o[0] == 100 && (64..=127).contains(&o[1]))
-            || (o[0] == 169 && o[1] == 254)
-            || (o[0] == 172 && (16..=31).contains(&o[1]))
-            || (o[0] == 192 && o[1] == 168)
-            || (o[0] == 192 && o[1] == 0 && (o[2] == 0 || o[2] == 2))
-            || (o[0] == 198 && (o[1] == 18 || o[1] == 19 || (o[1] == 51 && o[2] == 100)))
-            || (o[0] == 203 && o[1] == 0 && o[2] == 113)
-            || o[0] >= 224;
-        return !blocked;
-    }
-    if let Ok(ip) = h.parse::<std::net::Ipv6Addr>() {
-        if let Some(v4) = ip.to_ipv4_mapped() {
-            return host_is_public(&format!("http://{v4}/"));
+    };
+    match host {
+        url::Host::Ipv4(ip) => {
+            let o = ip.octets();
+            // 0/8, 10/8, 100.64/10 (CGNAT), 127/8, 169.254/16, 172.16/12,
+            // 192.0.0/24 + 192.0.2/24 (IETF protocol assignments + TEST-NET-1),
+            // 192.168/16, 198.18/15 (benchmark), 198.51.100/24 + 203.0.113/24
+            // (TEST-NET-2/3), 224/4 multicast, 240/4 reserved.
+            let blocked = o[0] == 0
+                || o[0] == 10
+                || o[0] == 127
+                || (o[0] == 100 && (64..=127).contains(&o[1]))
+                || (o[0] == 169 && o[1] == 254)
+                || (o[0] == 172 && (16..=31).contains(&o[1]))
+                || (o[0] == 192 && o[1] == 168)
+                || (o[0] == 192 && o[1] == 0 && (o[2] == 0 || o[2] == 2))
+                || (o[0] == 198 && (o[1] == 18 || o[1] == 19 || (o[1] == 51 && o[2] == 100)))
+                || (o[0] == 203 && o[1] == 0 && o[2] == 113)
+                || o[0] >= 224;
+            !blocked
         }
-        let seg0 = ip.segments()[0];
-        return !(ip.is_loopback()
-            || ip.is_unspecified()
-            || ip.is_multicast()
-            || (seg0 & 0xfe00) == 0xfc00 // fc00::/7 unique-local
-            || (seg0 & 0xffc0) == 0xfe80); // fe80::/10 link-local
+        url::Host::Ipv6(ip) => {
+            if let Some(v4) = ip.to_ipv4_mapped() {
+                return host_is_public(&format!("http://{v4}/"));
+            }
+            let seg0 = ip.segments()[0];
+            !(ip.is_loopback()
+                || ip.is_unspecified()
+                || ip.is_multicast()
+                || (seg0 & 0xfe00) == 0xfc00 // fc00::/7 unique-local
+                || (seg0 & 0xffc0) == 0xfe80) // fe80::/10 link-local
+        }
+        url::Host::Domain(domain) => {
+            let h = domain.trim_end_matches('.');
+            !(h == "localhost"
+                || h.ends_with(".localhost")
+                || h.ends_with(".local")
+                || h.ends_with(".internal")
+                || h.ends_with(".lan")
+                || h.ends_with(".home")
+                || h.ends_with(".corp"))
+        }
     }
-    // Ordinary DNS hostname — allowed (rebinding residual noted above).
-    true
 }
 
 /// All http(s) URLs in `content` worth processing: supported embed domains
@@ -216,9 +223,14 @@ fn extract_urls(content: &str) -> Vec<String> {
 /// Value of an HTML attribute like `property="..."` or `content='...'`
 /// (case-insensitive name, either quote style). Returns None if absent.
 fn html_attr(tag: &str, name: &str) -> Option<String> {
-    let lower = tag.to_lowercase();
+    // ASCII-only lowercase: `str::to_lowercase` can change byte length for
+    // non-ASCII text, which would desync the offsets we apply back to
+    // `tag`. `to_ascii_lowercase` is length-preserving, so offsets stay
+    // valid and still point at the original (un-lowercased) bytes.
+    let lower: Vec<u8> = tag.bytes().map(|b| b.to_ascii_lowercase()).collect();
+    let lower = std::str::from_utf8(&lower).ok()?;
     let needle = format!("{name}=");
-    let rest = lower.as_str();
+    let rest = lower;
     let mut from = 0;
     while let Some(pos) = rest[from..].find(&needle) {
         let eq = from + pos + needle.len();
@@ -241,8 +253,14 @@ fn html_attr(tag: &str, name: &str) -> Option<String> {
 fn extract_og_image(html: &str) -> Option<String> {
     for part in html.split("<meta") {
         let tag = part.split('>').next().unwrap_or(part);
-        let lower = tag.to_lowercase();
-        if !(lower.contains("og:image")) {
+        // Allocation-free ASCII case-insensitive scan — "og:image" is pure
+        // ASCII, so Unicode lowercasing buys nothing and `to_lowercase`
+        // would allocate once per <meta> tag on the page.
+        if !tag
+            .as_bytes()
+            .windows(b"og:image".len())
+            .any(|w| w.eq_ignore_ascii_case(b"og:image"))
+        {
             continue;
         }
         let url = html_attr(tag, "content")?;
@@ -326,7 +344,9 @@ async fn resolve_image_url(client: &reqwest::Client, page_url: &str) -> Result<S
     // Slow path: scrape og:image.
     let html = fetch_head(client, page_url).await?.error_for_status()?;
     let body = html.bytes().await?;
-    let body = String::from_utf8_lossy(&body[..body.len().min(128 * 1024)]);
+    // `get(..128k)` returns None when the cap lands mid-codepoint — fall
+    // back to the whole body rather than panicking on the byte slice.
+    let body = String::from_utf8_lossy(body.get(..128 * 1024).unwrap_or(body.as_ref()));
     let og = extract_og_image(&body).ok_or_else(|| anyhow::anyhow!("no og:image on page"))?;
     // og:image is attacker-influenced page content — same SSRF rule as
     // direct image links before we connect to it ourselves.
@@ -481,6 +501,8 @@ pub async fn cmd_fetch_links(ctx: &DcCtx, opts: FetchLinksOpts<'_>) -> ExitCode 
     let mut skipped = 0usize;
     let mut failed = 0usize;
     let mut files: Vec<String> = Vec::new();
+    // HashSet dedupe — `files.contains` was O(n²) over the run.
+    let mut seen_files = std::collections::HashSet::new();
     let total = links.len();
 
     for (i, (message_id, page_url)) in links.iter().enumerate() {
@@ -497,7 +519,7 @@ pub async fn cmd_fetch_links(ctx: &DcCtx, opts: FetchLinksOpts<'_>) -> ExitCode 
                         fetched += 1;
                     }
                     let p = path.to_string_lossy().into_owned();
-                    if !files.contains(&p) {
+                    if seen_files.insert(p.clone()) {
                         files.push(p);
                     }
                 }
@@ -650,6 +672,40 @@ mod tests {
         assert!(host_is_public("https://i.redd.it/abc123.png"));
         assert!(host_is_public("https://8.8.8.8/dns.png"));
         assert!(host_is_public("https://[2606:4700:4700::1111]/x.png"));
+    }
+
+    #[test]
+    fn ssrf_blocks_noncanonical_ip_forms() {
+        // WHATWG normalization turns all of these into loopback — they are
+        // not dotted-quads, so only the URL-parser guard catches them.
+        for u in [
+            "http://127.1/x.png",
+            "http://127.0.1/x.png",
+            "http://2130706433/x.png", // 127.0.0.1 decimal
+            "http://0x7f000001/x.png", // 127.0.0.1 hex
+            "http://0177.0.0.1/x.png", // 127.0.0.1 octal
+            "http://0x7f.1/x.png",
+        ] {
+            assert!(!host_is_public(u), "{u} should be blocked");
+        }
+    }
+
+    #[test]
+    fn html_attr_offsets_survive_non_ascii() {
+        // 'İ' lowercases to two chars under `to_lowercase` — offsets taken
+        // from a lowered copy would desync; the ASCII-only scan must still
+        // slice the original tag correctly.
+        let tag = "<meta İ property=\"og:image\" CONTENT=\"https://x.test/ü.png\">";
+        assert_eq!(
+            html_attr(tag, "content").as_deref(),
+            Some("https://x.test/ü.png")
+        );
+        // Either quote style; missing attr → None.
+        assert_eq!(
+            html_attr("<meta content='https://a.b/c.png'>", "content").as_deref(),
+            Some("https://a.b/c.png")
+        );
+        assert_eq!(html_attr("<meta property=\"og:image\">", "content"), None);
     }
 
     #[test]

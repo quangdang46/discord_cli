@@ -32,6 +32,16 @@ pub(crate) fn open_db() -> Result<discord_db::Connection> {
     ddb::open(db_path.to_str().unwrap_or("discord.db"))
 }
 
+/// True when the error chain contains a Discord 404 (`NotFound`).
+fn is_not_found(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| {
+        matches!(
+            c.downcast_ref::<discord_user::DiscordError>(),
+            Some(discord_user::DiscordError::NotFound { .. })
+        )
+    })
+}
+
 /// Ensure the channel (+ its guild) exists in the DB — foreign-key
 /// requirement before any message upsert. Resolve real name/guild_id/type
 /// via the API so archive queries show the channel name instead of its ID
@@ -41,6 +51,9 @@ pub(crate) async fn ensure_channel_row(
     client: &mut ApiClient,
     channel_id: &str,
 ) -> Result<Option<String>> {
+    // Propagate get_channel failures: the old `Err(_) =>` fallback upserted
+    // the channel with `guild_id=None, type=0`, so permission/network errors
+    // silently mislabeled guild channels as DMs and wasted fetches.
     let (ch_name, ch_guild, ch_type) = match client.get_channel(channel_id).await {
         Ok(ch) => (
             if ch.name.is_empty() {
@@ -51,14 +64,23 @@ pub(crate) async fn ensure_channel_row(
             ch.guild_id,
             ch.channel_type,
         ),
-        Err(_) => (channel_id.to_string(), None, 0),
+        Err(e) => return Err(e.context(format!("get_channel {channel_id}"))),
     };
     // Populate the guilds table FIRST so the channels FK (guild_id →
     // guilds.id) is satisfied when upserting the channel (bug: guilds were
     // never inserted, and the channel carried `guild_id = None`).
     if let Some(gid) = &ch_guild {
-        if let Ok(info) = client.guild_info(gid).await {
-            let _ = ddb::upsert_guild(conn, gid, &info.name, None);
+        match client.guild_info(gid).await {
+            Ok(info) => {
+                let _ = ddb::upsert_guild(conn, gid, &info.name, None);
+            }
+            Err(e) if is_not_found(&e) => {
+                // Guild truly absent (left/deleted): keep the FK satisfied
+                // with an id-named placeholder rather than skipping the row
+                // (a missing guilds row would FK-violate the channel upsert).
+                let _ = ddb::upsert_guild(conn, gid, gid, None);
+            }
+            Err(e) => return Err(e.context(format!("guild_info {gid}"))),
         }
     }
     ddb::upsert_channel(
@@ -73,42 +95,119 @@ pub(crate) async fn ensure_channel_row(
     Ok(ch_guild)
 }
 
+/// Channel metadata already fetched via `list_channels`/`list_guilds` —
+/// lets `sync-all` skip the redundant `get_channel` + `guild_info`
+/// round-trips per channel (the guild name comes from the guilds list,
+/// fetched once for the whole run).
+pub(crate) struct ChannelMeta<'a> {
+    pub name: &'a str,
+    pub guild_id: Option<&'a str>,
+    pub guild_name: Option<&'a str>,
+    pub channel_type: u8,
+}
+
+/// Write-side counterpart of `ensure_channel_row` for already-known
+/// metadata: same upserts, no API lookups. The guild name falls back to
+/// the id when unknown (keeps the channels FK satisfied).
+fn ensure_channel_row_meta(
+    conn: &discord_db::Connection,
+    channel_id: &str,
+    meta: &ChannelMeta<'_>,
+) -> Result<Option<String>> {
+    let ch_name = if meta.name.is_empty() {
+        channel_id.to_string()
+    } else {
+        meta.name.to_string()
+    };
+    if let Some(gid) = meta.guild_id {
+        let _ = ddb::upsert_guild(conn, gid, meta.guild_name.unwrap_or(gid), None);
+    }
+    ddb::upsert_channel(
+        conn,
+        channel_id,
+        meta.guild_id,
+        &ch_name,
+        meta.channel_type,
+        None,
+        None,
+    )?;
+    Ok(meta.guild_id.map(str::to_string))
+}
+
 /// Sync one channel into SQLite. Returns message count written.
 pub async fn sync_channel(client: &mut ApiClient, channel_id: &str, limit: usize) -> Result<usize> {
-    let mut conn = open_db()?;
+    let conn = open_db()?;
     let ch_guild = ensure_channel_row(&conn, client, channel_id).await?;
+    sync_channel_fetched(client, conn, channel_id, &ch_guild, limit).await
+}
 
+/// Sync one channel whose metadata is already known (sync-all path) —
+/// identical to `sync_channel` minus the `get_channel`/`guild_info`
+/// lookups.
+pub async fn sync_channel_meta(
+    client: &mut ApiClient,
+    channel_id: &str,
+    limit: usize,
+    meta: &ChannelMeta<'_>,
+) -> Result<usize> {
+    let conn = open_db()?;
+    let ch_guild = ensure_channel_row_meta(&conn, channel_id, meta)?;
+    sync_channel_fetched(client, conn, channel_id, &ch_guild, limit).await
+}
+
+/// Shared sync body: fetch (Phase A ∥ Phase B) then write in one
+/// transaction. `ch_guild` is the resolved guild id (or None for DMs).
+async fn sync_channel_fetched(
+    client: &mut ApiClient,
+    mut conn: discord_db::Connection,
+    channel_id: &str,
+    ch_guild: &Option<String>,
+    limit: usize,
+) -> Result<usize> {
     let (last_id, oldest_id) = ddb::get_sync_state(&conn, channel_id)?;
 
-    // Phase B (history backward) — always runs to backfill.
+    // Phase B (history backward) always runs to backfill; Phase A (new,
+    // forward) only when we have a last cursor. The two fetches are
+    // independent, so run them concurrently on a peer client — exactly 2
+    // in-flight requests per channel, still rate-limit friendly.
     let before = if oldest_id.is_empty() {
         None
     } else {
         oldest_id.parse().ok()
     };
-    let msgs = client
-        .fetch_messages(channel_id, limit, before, None)
-        .await?;
-
-    // Phase A (new, forward) — only when we have a last cursor.
-    let new_msgs = if last_id.is_empty() {
-        Vec::new()
-    } else {
+    let mut peer = client.peer();
+    let fetch_forward = async {
+        if last_id.is_empty() {
+            return Ok(Vec::new());
+        }
         let after: Option<u64> = last_id.parse().ok();
-        client
-            .fetch_messages(channel_id, limit, None, after)
-            .await?
+        peer.fetch_messages(channel_id, limit, None, after).await
     };
+    let (msgs_res, new_msgs_res) = tokio::join!(
+        client.fetch_messages(channel_id, limit, before, None),
+        fetch_forward
+    );
+    let msgs = msgs_res?;
+    let new_msgs = new_msgs_res?;
     let total = msgs.len() + new_msgs.len();
 
     // All writes in ONE transaction: hundreds of autocommit upserts were
     // fsync-per-row. Fetches already completed, so the write lock is held
-    // only for the (fast) local writes.
+    // only for the (fast) local writes. Statements are prepared once per
+    // batch — rusqlite `execute` re-prepares the SQL every call.
     let tx = conn.transaction()?;
-    for m in msgs.iter().chain(new_msgs.iter()) {
-        ddb::upsert_message(&tx, &row_from_msg(m, channel_id, ch_guild.as_deref()))?;
-        upsert_attachments(&tx, m, channel_id)?;
-    }
+    let rows: Vec<MessageRow> = msgs
+        .iter()
+        .chain(new_msgs.iter())
+        .map(|m| row_from_msg(m, channel_id, ch_guild.as_deref()))
+        .collect();
+    ddb::upsert_messages(&tx, &rows)?;
+    let atts: Vec<datt::NewAttachment> = msgs
+        .iter()
+        .chain(new_msgs.iter())
+        .flat_map(|m| attachment_rows(m, channel_id))
+        .collect();
+    datt::upsert_attachments(&tx, &atts)?;
 
     // Compute new cursors from BOTH phases: newest = max id seen across
     // Phase B (history) and Phase A (new), oldest = min id seen. Previously
@@ -171,18 +270,16 @@ fn row_from_msg(
     }
 }
 
-/// Upsert attachment ledger rows for a message (F6). Idempotent
-/// (INSERT OR IGNORE keyed by md5(msg_id|url)).
-fn upsert_attachments(
-    conn: &discord_db::Connection,
-    m: &discord_core::types::Message,
-    channel_id: &str,
-) -> anyhow::Result<()> {
-    if let Some(details) = &m.attachment_details {
-        for a in details {
-            datt::upsert_attachment(
-                conn,
-                &datt::NewAttachment {
+/// Build the attachment ledger rows for a message (F6). Idempotent
+/// (INSERT OR IGNORE keyed by md5(msg_id|url)). Shared by the batch sync
+/// path and the single-message gateway path.
+fn attachment_rows(m: &discord_core::types::Message, channel_id: &str) -> Vec<datt::NewAttachment> {
+    m.attachment_details
+        .as_ref()
+        .map(|details| {
+            details
+                .iter()
+                .map(|a| datt::NewAttachment {
                     id: attachment_id(&m.message_id, &a.url),
                     message_id: m.message_id.clone(),
                     channel_id: channel_id.to_string(),
@@ -190,11 +287,10 @@ fn upsert_attachments(
                     filename: a.filename.clone(),
                     content_type: a.content_type.clone(),
                     size: a.size,
-                },
-            )?;
-        }
-    }
-    Ok(())
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Convert a gateway MESSAGE_CREATE message to a db MessageRow, sharing the
@@ -233,20 +329,20 @@ pub(crate) fn persist_gateway_message(
     // Attachment ledger (F6): gateway attachments carry the same fields as
     // the REST shape — mirror the sync path's md5(msg_id|url) keying.
     if !m.attachments.is_empty() {
-        for a in &m.attachments {
-            datt::upsert_attachment(
-                conn,
-                &datt::NewAttachment {
-                    id: attachment_id(&m.id, &a.url),
-                    message_id: m.id.clone(),
-                    channel_id: channel_id.to_string(),
-                    url: a.url.clone(),
-                    filename: a.filename.clone(),
-                    content_type: a.content_type.clone(),
-                    size: Some(a.size as i64),
-                },
-            )?;
-        }
+        let rows: Vec<datt::NewAttachment> = m
+            .attachments
+            .iter()
+            .map(|a| datt::NewAttachment {
+                id: attachment_id(&m.id, &a.url),
+                message_id: m.id.clone(),
+                channel_id: channel_id.to_string(),
+                url: a.url.clone(),
+                filename: a.filename.clone(),
+                content_type: a.content_type.clone(),
+                size: Some(a.size as i64),
+            })
+            .collect();
+        datt::upsert_attachments(conn, &rows)?;
     }
     Ok(())
 }

@@ -12,6 +12,11 @@ pub fn open(path: &str) -> Result<Connection> {
     let conn = Connection::open(path).context("open sqlite")?;
     conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")
         .context("pragmas")?;
+    // `sync-all` runs a few channel syncs concurrently (bounded), each with
+    // its own connection — WAL allows one writer, so wait briefly for a
+    // peer's write transaction instead of failing with SQLITE_BUSY.
+    conn.busy_timeout(std::time::Duration::from_secs(10))
+        .context("busy_timeout")?;
     migrate(&conn)?;
     Ok(conn)
 }
@@ -90,50 +95,83 @@ fn migrate(conn: &Connection) -> Result<()> {
 /// referencing `messages(id)`, REPLACE (delete+insert) would violate the FK
 /// on every re-sync of a channel containing attachments (review#1). UPDATE
 /// preserves the row identity and the FTS triggers handle it.
-pub fn upsert_message(conn: &Connection, msg: &crate::MessageRow) -> Result<bool> {
-    let changed = conn
-        .execute(
-            r#"
-            INSERT INTO messages
-                (id, channel_id, guild_id, author_id, author_name, content, timestamp, edited, reaction_count)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
-            ON CONFLICT(id) DO UPDATE SET
-                channel_id = excluded.channel_id,
-                guild_id = excluded.guild_id,
-                author_id = excluded.author_id,
-                author_name = excluded.author_name,
-                content = excluded.content,
-                timestamp = excluded.timestamp,
-                edited = excluded.edited,
-                reaction_count = excluded.reaction_count
-            "#,
-            params![
-                msg.id,
-                msg.channel_id,
-                msg.guild_id,
-                msg.author_id,
-                msg.author_name,
-                msg.content,
-                msg.timestamp,
-                msg.edited,
-                msg.reaction_count,
-            ],
-        )
+const UPSERT_MESSAGE_SQL: &str = r#"
+    INSERT INTO messages
+        (id, channel_id, guild_id, author_id, author_name, content, timestamp, edited, reaction_count)
+    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+    ON CONFLICT(id) DO UPDATE SET
+        channel_id = excluded.channel_id,
+        guild_id = excluded.guild_id,
+        author_id = excluded.author_id,
+        author_name = excluded.author_name,
+        content = excluded.content,
+        timestamp = excluded.timestamp,
+        edited = excluded.edited,
+        reaction_count = excluded.reaction_count
+    "#;
+
+fn upsert_message_with(
+    stmt: &mut rusqlite::Statement<'_>,
+    msg: &crate::MessageRow,
+) -> Result<bool> {
+    let changed = stmt
+        .execute(params![
+            msg.id,
+            msg.channel_id,
+            msg.guild_id,
+            msg.author_id,
+            msg.author_name,
+            msg.content,
+            msg.timestamp,
+            msg.edited,
+            msg.reaction_count,
+        ])
         .context("upsert message")?;
     Ok(changed > 0)
 }
 
-/// Upsert a guild (INSERT OR REPLACE).
+pub fn upsert_message(conn: &Connection, msg: &crate::MessageRow) -> Result<bool> {
+    let mut stmt = conn
+        .prepare(UPSERT_MESSAGE_SQL)
+        .context("prepare upsert message")?;
+    upsert_message_with(&mut stmt, msg)
+}
+
+/// Batch variant of [`upsert_message`]: prepares the statement ONCE and
+/// loops `execute` — rusqlite `Connection::execute` re-prepares the SQL on
+/// every call, which dominated sync runs writing hundreds of rows.
+/// Returns the number of rows that changed (same semantics as the
+/// per-row `changed > 0` flag summed).
+pub fn upsert_messages(conn: &Connection, msgs: &[crate::MessageRow]) -> Result<usize> {
+    if msgs.is_empty() {
+        return Ok(0);
+    }
+    let mut stmt = conn
+        .prepare(UPSERT_MESSAGE_SQL)
+        .context("prepare upsert messages")?;
+    let mut changed = 0usize;
+    for msg in msgs {
+        if upsert_message_with(&mut stmt, msg)? {
+            changed += 1;
+        }
+    }
+    Ok(changed)
+}
+
+/// Upsert a guild (ON CONFLICT DO UPDATE — NOT INSERT OR REPLACE: REPLACE
+/// is delete+insert, risky under foreign_keys=ON).
 pub fn upsert_guild(conn: &Connection, id: &str, name: &str, icon: Option<&str>) -> Result<()> {
     conn.execute(
-        "INSERT OR REPLACE INTO guilds (id, name, icon) VALUES (?1, ?2, ?3)",
+        "INSERT INTO guilds (id, name, icon) VALUES (?1, ?2, ?3)
+         ON CONFLICT(id) DO UPDATE SET name = excluded.name, icon = excluded.icon",
         params![id, name, icon],
     )
     .context("upsert guild")?;
     Ok(())
 }
 
-/// Upsert a channel (INSERT OR REPLACE).
+/// Upsert a channel (ON CONFLICT DO UPDATE — NOT INSERT OR REPLACE: REPLACE
+/// is delete+insert, risky under foreign_keys=ON when messages reference it).
 pub fn upsert_channel(
     conn: &Connection,
     id: &str,
@@ -143,8 +181,14 @@ pub fn upsert_channel(
     topic: Option<&str>,
     parent_id: Option<&str>,
 ) -> Result<()> {
+    // ON CONFLICT DO UPDATE (not INSERT OR REPLACE): REPLACE is delete+insert,
+    // which is risky under foreign_keys=ON when messages reference the channel.
     conn.execute(
-        "INSERT OR REPLACE INTO channels (id, guild_id, name, type, topic, parent_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        "INSERT INTO channels (id, guild_id, name, type, topic, parent_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+         ON CONFLICT(id) DO UPDATE SET
+            guild_id = excluded.guild_id, name = excluded.name, type = excluded.type,
+            topic = excluded.topic, parent_id = excluded.parent_id",
         params![id, guild_id, name, channel_type, topic, parent_id],
     )
     .context("upsert channel")?;
@@ -247,8 +291,16 @@ pub fn recent_messages(
         params.push(Box::new(format!("%{}%", like_escape(ch))));
     }
     if let Some(h) = hours {
-        sql.push_str(" AND m.timestamp >= datetime('now', ?)");
-        params.push(Box::new(format!("-{} hours", h)));
+        // Stored timestamps are RFC3339 (`2026-08-09T17:00:00+00:00`), so a
+        // SQLite `datetime('now', '-N hours')` cutoff ('YYYY-MM-DD HH:MM:SS',
+        // space-separated) never compares correctly — 'T' > ' ' — and a
+        // non-positive `h` also yields an invalid modifier. Compute the
+        // cutoff in Rust and bind it like `today_messages`.
+        let cutoff = (chrono::Utc::now() - chrono::Duration::hours(h))
+            .format("%Y-%m-%dT%H:%M:%S")
+            .to_string();
+        sql.push_str(" AND m.timestamp >= ?");
+        params.push(Box::new(cutoff));
     }
     sql.push_str(" ORDER BY m.timestamp DESC LIMIT ?");
     params.push(Box::new(limit));
@@ -601,6 +653,20 @@ fn fts5_match_query(query: &str) -> Result<String> {
     Ok(terms.join(" AND "))
 }
 
+/// Optional predicates for [`search_messages_filtered`], pushed into SQL
+/// so `LIMIT` applies AFTER filtering — post-hoc `retain` on a
+/// pre-limited hit list can under-fill the page.
+#[derive(Debug, Clone, Default)]
+pub struct SearchFilter {
+    /// Channel-name substring (`channels.name LIKE %..%`, ASCII
+    /// case-insensitive like `recent_messages`).
+    pub channel: Option<String>,
+    /// Author-name substring (`messages.author_name LIKE %..%`).
+    pub author: Option<String>,
+    /// RFC3339 timestamp cutoff (`messages.timestamp >= since`).
+    pub since: Option<String>,
+}
+
 /// FTS5 full-text search over stored messages.
 ///
 /// The user query is sanitized by [`fts5_match_query`] — never bind raw
@@ -610,36 +676,63 @@ pub fn search_messages(
     query: &str,
     limit: i64,
 ) -> Result<Vec<crate::SearchHit>> {
+    search_messages_filtered(conn, query, &SearchFilter::default(), limit)
+}
+
+/// [`search_messages`] with optional channel/author/since predicates
+/// applied inside the query (before `LIMIT`).
+pub fn search_messages_filtered(
+    conn: &Connection,
+    query: &str,
+    filter: &SearchFilter,
+    limit: i64,
+) -> Result<Vec<crate::SearchHit>> {
     let match_expr = fts5_match_query(query)?;
-    let mut stmt = conn
-        .prepare(
-            r#"
-            SELECT m.id, m.channel_id, c.name AS channel_name,
-                   COALESCE(g.name,'DM') AS guild_name, m.author_name, m.content,
-                   m.timestamp, rank
-            FROM messages_fts
-            JOIN messages m ON messages_fts.rowid = m.rowid
-            JOIN channels c ON m.channel_id = c.id
-            LEFT JOIN guilds g ON m.guild_id = g.id
-            WHERE messages_fts MATCH ?1
-            ORDER BY rank
-            LIMIT ?2
-            "#,
-        )
-        .context("prepare search")?;
+    let mut sql = String::from(
+        r#"
+        SELECT m.id, m.channel_id, c.name AS channel_name,
+               COALESCE(g.name,'DM') AS guild_name, m.author_name, m.content,
+               m.timestamp, rank
+        FROM messages_fts
+        JOIN messages m ON messages_fts.rowid = m.rowid
+        JOIN channels c ON m.channel_id = c.id
+        LEFT JOIN guilds g ON m.guild_id = g.id
+        WHERE messages_fts MATCH ?1
+        "#,
+    );
+    let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = vec![Box::new(match_expr)];
+    if let Some(ch) = &filter.channel {
+        sql.push_str(" AND c.name LIKE ? ESCAPE '\\'");
+        params.push(Box::new(format!("%{}%", like_escape(ch))));
+    }
+    if let Some(a) = &filter.author {
+        sql.push_str(" AND m.author_name LIKE ? ESCAPE '\\'");
+        params.push(Box::new(format!("%{}%", like_escape(a))));
+    }
+    if let Some(s) = &filter.since {
+        sql.push_str(" AND m.timestamp >= ?");
+        params.push(Box::new(s.clone()));
+    }
+    sql.push_str(" ORDER BY rank LIMIT ?");
+    params.push(Box::new(limit));
+
+    let mut stmt = conn.prepare(&sql).context("prepare search")?;
     let rows = stmt
-        .query_map(params![match_expr, limit], |row| {
-            Ok(crate::SearchHit {
-                id: row.get(0)?,
-                channel_id: row.get(1)?,
-                channel_name: row.get(2)?,
-                guild_name: row.get(3)?,
-                author_name: row.get(4)?,
-                content: row.get(5)?,
-                timestamp: row.get(6)?,
-                rank: row.get(7)?,
-            })
-        })
+        .query_map(
+            rusqlite::params_from_iter(params.iter().map(|p| p.as_ref())),
+            |row| {
+                Ok(crate::SearchHit {
+                    id: row.get(0)?,
+                    channel_id: row.get(1)?,
+                    channel_name: row.get(2)?,
+                    guild_name: row.get(3)?,
+                    author_name: row.get(4)?,
+                    content: row.get(5)?,
+                    timestamp: row.get(6)?,
+                    rank: row.get(7)?,
+                })
+            },
+        )
         .context("query search")?;
     let mut out = Vec::new();
     for r in rows {
@@ -864,6 +957,27 @@ mod tests {
         let conn = temp_db();
         upsert_channel(&conn, "c1", None, "general", 0, None, None).unwrap();
         assert!(timeline(&conn, "week").is_err());
+    }
+
+    #[test]
+    fn recent_messages_hours_compares_rfc3339_cutoff() {
+        let conn = temp_db();
+        upsert_guild(&conn, "g1", "Test Guild", None).unwrap();
+        upsert_channel(&conn, "c1", Some("g1"), "general", 0, None, None).unwrap();
+        // A message "now" survives --hours 1; a 2020 message must not —
+        // the old `datetime('now', '-1 hours')` modifier produced a
+        // space-separated cutoff that never compared correctly against
+        // RFC3339 'T'-separated timestamps.
+        let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+        seed_message(&conn, "1", "alice", &now);
+        seed_message(&conn, "2", "bob", "2020-01-01T00:00:00Z");
+        let hits = recent_messages(&conn, None, Some(1), 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, "1");
+        // A huge window includes both, newest first.
+        let hits = recent_messages(&conn, None, Some(24 * 365 * 100), 10).unwrap();
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].id, "1");
     }
 }
 

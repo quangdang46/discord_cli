@@ -25,3 +25,5 @@ discord-user-rs.workspace = true
 mime_guess = "2"
 md-5 = "0.10"
 reqwest.workspace = true
+futures-util = "0.3"
+url.workspace = true

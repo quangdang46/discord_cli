@@ -13,6 +13,13 @@ use discord_core::client::{ApiClient, GuildResolution};
 use discord_core::output::{self, exit};
 use discord_core::types::{Channel, Role};
 
+/// Case-insensitive equality with `to_lowercase()` semantics but no
+/// per-element allocation: ASCII fast-path (`eq_ignore_ascii_case`),
+/// Unicode fallback for non-ASCII case pairs. `b` must already be lowered.
+fn ci_eq(a: &str, b: &str) -> bool {
+    a.eq_ignore_ascii_case(b) || a.to_lowercase() == b
+}
+
 /// Emit a structured error envelope for a resolver API failure and return the
 /// matching exit code (admin commands must never leak plain `error:` text —
 /// agents parse `{ok:false,error:{code}}`).
@@ -78,7 +85,7 @@ pub async fn resolve_channel_admin(
     let needle = clean.to_lowercase();
     let matches: Vec<&Channel> = channels
         .iter()
-        .filter(|c| c.name.to_lowercase() == needle)
+        .filter(|c| ci_eq(&c.name, &needle))
         .collect();
 
     match matches.len() {
@@ -121,7 +128,7 @@ pub async fn resolve_category(
     let needle = clean.to_lowercase();
     let matches: Vec<&&Channel> = categories
         .iter()
-        .filter(|c| c.name.to_lowercase() == needle)
+        .filter(|c| ci_eq(&c.name, &needle))
         .collect();
     match matches.len() {
         1 => Ok(Some(matches[0].id.clone())),
@@ -148,10 +155,7 @@ pub async fn resolve_role(
     }
     let clean = name.trim_start_matches(['@', '#']);
     let needle = clean.to_lowercase();
-    let matches: Vec<&Role> = roles
-        .iter()
-        .filter(|r| r.name.to_lowercase() == needle)
-        .collect();
+    let matches: Vec<&Role> = roles.iter().filter(|r| ci_eq(&r.name, &needle)).collect();
     match matches.len() {
         1 => Ok(Some(matches[0].id.clone())),
         n if n > 1 => {
@@ -188,11 +192,9 @@ pub async fn resolve_member(
     let matches: Vec<&discord_core::types::Member> = members
         .iter()
         .filter(|m| {
-            m.username.to_lowercase() == clean
-                || m.global_name
-                    .as_ref()
-                    .is_some_and(|g| g.to_lowercase() == clean)
-                || m.nick.as_ref().is_some_and(|n| n.to_lowercase() == clean)
+            ci_eq(&m.username, &clean)
+                || m.global_name.as_ref().is_some_and(|g| ci_eq(g, &clean))
+                || m.nick.as_ref().is_some_and(|n| ci_eq(n, &clean))
         })
         .collect();
     match matches.len() {
@@ -235,11 +237,9 @@ pub async fn resolve_member_info(
         .iter()
         .filter(|m| {
             m.id == name
-                || m.username.to_lowercase() == clean
-                || m.global_name
-                    .as_ref()
-                    .is_some_and(|g| g.to_lowercase() == clean)
-                || m.nick.as_ref().is_some_and(|n| n.to_lowercase() == clean)
+                || ci_eq(&m.username, &clean)
+                || m.global_name.as_ref().is_some_and(|g| ci_eq(g, &clean))
+                || m.nick.as_ref().is_some_and(|n| ci_eq(n, &clean))
         })
         .collect();
     match matches.len() {
@@ -286,11 +286,7 @@ pub async fn resolve_emoji(
     let needle = clean.to_lowercase();
     let matches: Vec<&discord_user::types::GuildEmoji> = emojis
         .iter()
-        .filter(|e| {
-            e.name
-                .as_deref()
-                .is_some_and(|n| n.to_lowercase() == needle)
-        })
+        .filter(|e| e.name.as_deref().is_some_and(|n| ci_eq(n, &needle)))
         .collect();
     match matches.len() {
         1 => Ok(Some(matches[0].clone())),
@@ -305,6 +301,7 @@ pub async fn resolve_emoji(
 
 #[cfg(test)]
 mod tests {
+    use super::ci_eq;
     use discord_core::types::{Channel, Role};
 
     fn ch(id: &str, name: &str, channel_type: u8) -> Channel {
@@ -337,10 +334,7 @@ mod tests {
     fn exact_case_insensitive_match() {
         let channels = [ch("1", "General", 0), ch("2", "announcements", 5)];
         let needle = "general";
-        let matches: Vec<&Channel> = channels
-            .iter()
-            .filter(|c| c.name.to_lowercase() == needle.to_lowercase())
-            .collect();
+        let matches: Vec<&Channel> = channels.iter().filter(|c| ci_eq(&c.name, needle)).collect();
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0].id, "1");
     }
@@ -349,10 +343,7 @@ mod tests {
     fn ambiguity_detects_multiple() {
         let channels = [ch("1", "general", 0), ch("2", "General", 2)];
         let needle = "general";
-        let matches: Vec<&Channel> = channels
-            .iter()
-            .filter(|c| c.name.to_lowercase() == needle.to_lowercase())
-            .collect();
+        let matches: Vec<&Channel> = channels.iter().filter(|c| ci_eq(&c.name, needle)).collect();
         assert_eq!(matches.len(), 2); // both text + voice "general"
     }
 
@@ -425,10 +416,7 @@ mod tests {
             },
         ];
         let needle = "mod";
-        let m: Vec<&Role> = roles
-            .iter()
-            .filter(|r| r.name.to_lowercase() == needle)
-            .collect();
+        let m: Vec<&Role> = roles.iter().filter(|r| ci_eq(&r.name, needle)).collect();
         assert_eq!(m.len(), 2);
     }
 
@@ -457,11 +445,9 @@ mod tests {
         let m: Vec<_> = members
             .iter()
             .filter(|m| {
-                m.username.to_lowercase() == clean
-                    || m.global_name
-                        .as_ref()
-                        .is_some_and(|g| g.to_lowercase() == clean)
-                    || m.nick.as_ref().is_some_and(|n| n.to_lowercase() == clean)
+                ci_eq(&m.username, clean)
+                    || m.global_name.as_ref().is_some_and(|g| ci_eq(g, clean))
+                    || m.nick.as_ref().is_some_and(|n| ci_eq(n, clean))
             })
             .collect();
         assert_eq!(m.len(), 1);
@@ -503,11 +489,9 @@ mod tests {
         let m: Vec<_> = members
             .iter()
             .filter(|m| {
-                m.username.to_lowercase() == clean
-                    || m.global_name
-                        .as_ref()
-                        .is_some_and(|g| g.to_lowercase() == clean)
-                    || m.nick.as_ref().is_some_and(|n| n.to_lowercase() == clean)
+                ci_eq(&m.username, clean)
+                    || m.global_name.as_ref().is_some_and(|g| ci_eq(g, clean))
+                    || m.nick.as_ref().is_some_and(|n| ci_eq(n, clean))
             })
             .collect();
         assert_eq!(m.len(), 1);
@@ -517,11 +501,9 @@ mod tests {
         let m: Vec<_> = members
             .iter()
             .filter(|m| {
-                m.username.to_lowercase() == clean
-                    || m.global_name
-                        .as_ref()
-                        .is_some_and(|g| g.to_lowercase() == clean)
-                    || m.nick.as_ref().is_some_and(|n| n.to_lowercase() == clean)
+                ci_eq(&m.username, clean)
+                    || m.global_name.as_ref().is_some_and(|g| ci_eq(g, clean))
+                    || m.nick.as_ref().is_some_and(|n| ci_eq(n, clean))
             })
             .collect();
         assert_eq!(m.len(), 1);
@@ -535,11 +517,9 @@ mod tests {
         let m: Vec<_> = members
             .iter()
             .filter(|m| {
-                m.username.to_lowercase() == clean
-                    || m.global_name
-                        .as_ref()
-                        .is_some_and(|g| g.to_lowercase() == clean)
-                    || m.nick.as_ref().is_some_and(|n| n.to_lowercase() == clean)
+                ci_eq(&m.username, clean)
+                    || m.global_name.as_ref().is_some_and(|g| ci_eq(g, clean))
+                    || m.nick.as_ref().is_some_and(|n| ci_eq(n, clean))
             })
             .collect();
         assert!(m.is_empty());

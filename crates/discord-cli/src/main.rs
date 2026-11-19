@@ -25,6 +25,8 @@ WARNING: automating a user account may violate Discord ToS — use only on accou
 )]
 struct Cli {
     /// Discord token (overrides env/.env/keyring).
+    /// NOTE: visible in the process list (`ps`) — prefer DISCORD_TOKEN or
+    /// `discord auth --save` (keyring) when possible.
     #[arg(long, global = true)]
     token: Option<String>,
 
@@ -83,7 +85,8 @@ enum Command {
         #[arg(long)]
         before: Option<u64>,
         /// Fetch messages after this snowflake.
-        #[arg(long)]
+        /// Mutually exclusive with --before: Discord rejects both cursors.
+        #[arg(long, conflicts_with = "before")]
         after: Option<u64>,
     },
     /// Read recent messages (default 50) — the key AI-facing read.
@@ -898,10 +901,16 @@ fn main() -> ExitCode {
             .stack_size(32 * 1024 * 1024)
             .spawn(run)
             .expect("spawn worker");
-        worker.join().unwrap_or(ExitCode::from(1))
+        let code = worker.join().unwrap_or(ExitCode::from(1));
+        discord_core::output::flush_out_buf();
+        code
     }
     #[cfg(not(windows))]
-    run()
+    {
+        let code = run();
+        discord_core::output::flush_out_buf();
+        code
+    }
 }
 
 #[tokio::main]
@@ -1583,22 +1592,31 @@ async fn cmd_auth(save: bool, paste: bool, qr: bool, format: Format) -> ExitCode
             exit::ERROR,
         ));
     }
-    // Validate each candidate, pick first valid.
+    // Validate each candidate, pick first valid. Track the last transport/
+    // API error so a network failure isn't misreported as "invalid token".
+    let mut last_err: Option<String> = None;
     for (source, token) in &tokens {
-        if let Ok(true) = discord_auth::auth::validate_token(token).await {
-            if save {
-                let _ = discord_auth::auth::save_token(token, None);
+        match discord_auth::auth::validate_token(token).await {
+            Ok(true) => {
+                if save {
+                    let _ = discord_auth::auth::save_token(token, None);
+                }
+                let _ = output::emit(
+                    &serde_json::json!({ "authenticated": true, "source": source, "token_saved": save }),
+                    format,
+                );
+                return ExitCode::from(exit::OK);
             }
-            let _ = output::emit(
-                &serde_json::json!({ "authenticated": true, "source": source, "token_saved": save }),
-                format,
-            );
-            return ExitCode::from(exit::OK);
+            Ok(false) => {}
+            Err(e) => last_err = Some(format!("{source}: {e}")),
         }
     }
+    let detail = last_err
+        .map(|e| format!(" (last validation error: {e})"))
+        .unwrap_or_default();
     ExitCode::from(output::emit_error(
         "InvalidTokens",
-        "found token(s) but none validated against Discord",
+        &format!("found token(s) but none validated against Discord{detail}"),
         exit::ERROR,
     ))
 }

@@ -97,15 +97,14 @@ pub async fn dc_tail(ctx: &DcCtx, channel_id: &str, once: bool) -> ExitCode {
                 return;
             }
             // JSONL line: timestamp, author, content — agent-friendly.
-            let author = event.message.author.username.clone();
-            let content = event.message.content.clone();
-            let ts = chrono::Utc::now().to_rfc3339();
+            // Move the fields into the json! (event is owned) instead of
+            // cloning author/content first.
             let line = serde_json::json!({
                 "type": "message",
-                "timestamp": ts,
-                "channel_id": event.message.channel_id.to_string(),
-                "author": author,
-                "content": content,
+                "timestamp": chrono::Utc::now().to_rfc3339(),
+                "channel_id": event.message.channel_id,
+                "author": event.message.author.username,
+                "content": event.message.content,
             });
             output::out_line(&serde_json::to_string(&line).unwrap_or_default());
         })
@@ -180,18 +179,19 @@ pub async fn dc_watch(
                     return;
                 }
             }
-            let content = event.message.content.clone();
+            // Keyword filter BEFORE cloning content — filtered-out
+            // messages cost only the lowercase scan, not a String clone.
             if let Some(kw) = &target_kw {
-                if !content.to_lowercase().contains(kw) {
+                if !event.message.content.to_lowercase().contains(kw) {
                     return;
                 }
             }
             let line = serde_json::json!({
                 "type": "message",
                 "timestamp": chrono::Utc::now().to_rfc3339(),
-                "channel_id": event.message.channel_id.to_string(),
+                "channel_id": event.message.channel_id,
                 "author": event.message.author.username,
-                "content": content,
+                "content": event.message.content,
             });
             output::out_line(&serde_json::to_string(&line).unwrap_or_default());
         })

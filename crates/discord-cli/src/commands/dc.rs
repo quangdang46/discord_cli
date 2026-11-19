@@ -91,7 +91,7 @@ pub async fn dc_guilds(ctx: &DcCtx) -> ExitCode {
     };
     match client.list_guilds().await {
         Ok(guilds) => {
-            let _ = output::emit(&guilds, ctx.format);
+            let _ = output::emit_rows(&guilds, ctx.format);
             ExitCode::from(exit::OK)
         }
         Err(e) => ExitCode::from(output::emit_error("ApiError", &e.to_string(), classify(&e))),
@@ -110,7 +110,7 @@ pub async fn dc_channels(ctx: &DcCtx, guild: &str) -> ExitCode {
     };
     match client.list_channels(&guild_id).await {
         Ok(channels) => {
-            let _ = output::emit(&channels, ctx.format);
+            let _ = output::emit_rows(&channels, ctx.format);
             ExitCode::from(exit::OK)
         }
         Err(e) => ExitCode::from(output::emit_error("ApiError", &e.to_string(), classify(&e))),
@@ -125,7 +125,7 @@ pub async fn dc_dms(ctx: &DcCtx) -> ExitCode {
     };
     match client.list_dms().await {
         Ok(dms) => {
-            let _ = output::emit(&dms, ctx.format);
+            let _ = output::emit_rows(&dms, ctx.format);
             ExitCode::from(exit::OK)
         }
         Err(e) => ExitCode::from(output::emit_error("ApiError", &e.to_string(), classify(&e))),
@@ -152,31 +152,94 @@ pub(crate) async fn resolve_channel_id(
         }
     };
     let needle = channel.to_lowercase();
-    for g in &guilds {
-        // Use get_guild_channels_all (all channel types, no text-like filter)
-        // and match exact-first, then substring — channel names often carry
-        // emoji/decoration suffixes (e.g. "chit-chat┊💬"), so "chit-chat"
-        // must still resolve (matches resolve_guild_id's contains pattern).
-        if let Ok(chs) = client.get_guild_channels_all(&g.id).await {
-            // Exact match first.
-            if let Some(c) = chs.iter().find(|c| c.name.to_lowercase() == needle) {
-                return Ok(c.id.clone());
-            }
-            // Substring/contains fallback (exact failed).
-            let fuzzy: Vec<&discord_core::types::Channel> = chs
+    // Collect fuzzy (substring) matches across ALL guilds instead of
+    // returning the first single hit per guild — multiple fuzzy hits must
+    // surface as an ambiguity error, not silently resolve or 404.
+    let mut fuzzy: Vec<(String, String)> = Vec::new(); // (channel id, label)
+
+    // Fetch every guild's channel list CONCURRENTLY, bounded to 4 in-flight
+    // requests (rate-limit friendly). Each worker owns a peer ApiClient —
+    // the HTTP client is `&mut self`, so the futures can't share `client`.
+    // Names come back as lightweight (id, name) pairs sorted by position:
+    // resolution never needs topics/permission_overwrites.
+    const MAX_IN_FLIGHT: usize = 4;
+    let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_IN_FLIGHT));
+    let mut set = tokio::task::JoinSet::new();
+    for (i, g) in guilds.iter().enumerate() {
+        let gid = g.id.clone();
+        let mut peer = client.peer();
+        let sem = sem.clone();
+        set.spawn(async move {
+            let _permit = sem.acquire_owned().await.ok();
+            let res = peer.guild_channel_names(&gid).await;
+            (i, res)
+        });
+    }
+    // Reassemble in guild order — match priority is guild order, then
+    // exact-before-substring within a guild (same as the serial loop).
+    type GuildNames = Option<Result<Vec<(String, String)>, anyhow::Error>>;
+    let mut by_guild: Vec<GuildNames> = (0..guilds.len()).map(|_| None).collect();
+    while let Some(joined) = set.join_next().await {
+        if let Ok((i, res)) = joined {
+            by_guild[i] = Some(res);
+        }
+    }
+    for names in by_guild.into_iter().flatten() {
+        // A failed guild fetch is skipped (same as the old `if let Ok`).
+        let Ok(names) = names else { continue };
+        // Lowercase each name ONCE — the old code allocated twice per
+        // channel (once for ==, once for contains). Keep the original for
+        // the ambiguity label (`#Name` shows real casing).
+        let lowered: Vec<(String, String, String)> = names
+            .into_iter()
+            .map(|(id, name)| {
+                let lower = name.to_lowercase();
+                (id, name, lower)
+            })
+            .collect();
+        // Exact match first.
+        if let Some((id, _, _)) = lowered.iter().find(|(_, _, n)| *n == needle) {
+            return Ok(id.clone());
+        }
+        fuzzy.extend(
+            lowered
                 .iter()
-                .filter(|c| c.name.to_lowercase().contains(&needle))
-                .collect();
-            if fuzzy.len() == 1 {
-                return Ok(fuzzy[0].id.clone());
+                .filter(|(_, _, n)| n.contains(&needle))
+                .map(|(id, name, _)| (id.clone(), format!("#{}", name))),
+        );
+    }
+    // DM fallback: guild channels never matched — DM/group-DM channels have
+    // no guild, so search their labels (recipient tags / group name).
+    if let Ok(dms) = client.list_dms().await {
+        for d in &dms {
+            let label = d.label.to_lowercase();
+            if label == needle {
+                return Ok(d.id.clone());
+            }
+            if label.contains(&needle) {
+                fuzzy.push((d.id.clone(), d.label.clone()));
             }
         }
     }
-    Err(ExitCode::from(output::emit_error(
-        "NotFound",
-        &format!("channel \"{channel}\" not found"),
-        exit::NOT_FOUND,
-    )))
+    match fuzzy.len() {
+        0 => Err(ExitCode::from(output::emit_error(
+            "NotFound",
+            &format!("channel \"{channel}\" not found"),
+            exit::NOT_FOUND,
+        ))),
+        1 => Ok(fuzzy[0].0.clone()),
+        _ => {
+            let names: Vec<&str> = fuzzy.iter().map(|(_, l)| l.as_str()).collect();
+            Err(ExitCode::from(output::emit_error(
+                "Usage",
+                &format!(
+                    "ambiguous channel \"{channel}\". Matches: {}. Use the channel ID instead.",
+                    names.join(", ")
+                ),
+                exit::USAGE,
+            )))
+        }
+    }
 }
 
 /// `dc history <CHANNEL>` — channel is an ID (or we resolve via a guild).
@@ -201,7 +264,7 @@ pub async fn dc_history(
         .await
     {
         Ok(msgs) => {
-            let _ = output::emit(&msgs, ctx.format);
+            let _ = output::emit_rows(&msgs, ctx.format);
             ExitCode::from(exit::OK)
         }
         Err(e) => ExitCode::from(output::emit_error("ApiError", &e.to_string(), classify(&e))),
@@ -253,12 +316,17 @@ pub async fn dc_read(
     match around {
         Some(anchor) => {
             let (n_before, n_after) = split_around_limit(limit);
+            // The two side-fetches are independent — run them concurrently
+            // on a peer client (2 in-flight requests, rate-limit friendly).
+            // Error precedence is unchanged: the before-side error wins.
+            let mut peer = client.peer();
+            let (before_res, after_res) = tokio::join!(
+                client.fetch_messages(&channel_id, n_before, Some(anchor), after),
+                peer.fetch_messages(&channel_id, n_after, None, Some(anchor).or(after)),
+            );
             let mut msgs = Vec::new();
             // Messages strictly older than the anchor (`before` cursor).
-            match client
-                .fetch_messages(&channel_id, n_before, Some(anchor), after)
-                .await
-            {
+            match before_res {
                 Ok(before_msgs) => msgs.extend(before_msgs),
                 Err(e) => {
                     return ExitCode::from(output::emit_error(
@@ -269,10 +337,7 @@ pub async fn dc_read(
                 }
             }
             // Messages strictly newer than the anchor (`after` cursor).
-            match client
-                .fetch_messages(&channel_id, n_after, None, Some(anchor).or(after))
-                .await
-            {
+            match after_res {
                 Ok(after_msgs) => msgs.extend(after_msgs),
                 Err(e) => {
                     return ExitCode::from(output::emit_error(
@@ -284,14 +349,37 @@ pub async fn dc_read(
             }
             // Both fetches return ascending — a plain merge sort by id
             // (fetch_messages already sorts each batch; re-sort defensively).
-            msgs.sort_by_key(|m| m.message_id.clone());
+            // Snowflakes compare NUMERICALLY (lexical breaks across digit
+            // counts); no per-message String clone for the sort key.
+            msgs.sort_unstable_by(|a, b| {
+                match (a.message_id.parse::<u64>(), b.message_id.parse::<u64>()) {
+                    (Ok(x), Ok(y)) => x.cmp(&y),
+                    _ => a.message_id.cmp(&b.message_id),
+                }
+            });
+            // fetch_messages can't send before+after together (Discord 400s
+            // on two cursors), so the --since lower bound was dropped from
+            // the before-side fetch — re-apply it here on the snowflake.
+            if let Some(a) = after {
+                msgs.retain(|m| m.message_id.parse::<u64>().map_or(true, |id| id > a));
+            }
             emit_read(&msgs, ctx.format, transcript)
         }
         None => match client
             .fetch_messages(&channel_id, limit, before, after)
             .await
         {
-            Ok(msgs) => emit_read(&msgs, ctx.format, transcript),
+            Ok(mut msgs) => {
+                // Same dropped-cursor case as --around: when --before and
+                // --since are combined, `after` was dropped — re-apply the
+                // --since lower bound on the snowflake.
+                if before.is_some() {
+                    if let Some(a) = after {
+                        msgs.retain(|m| m.message_id.parse::<u64>().map_or(true, |id| id > a));
+                    }
+                }
+                emit_read(&msgs, ctx.format, transcript)
+            }
             Err(e) => ExitCode::from(output::emit_error("ApiError", &e.to_string(), classify(&e))),
         },
     }
@@ -321,7 +409,7 @@ fn emit_read(
         }
         ExitCode::from(exit::OK)
     } else {
-        let _ = output::emit(msgs, format);
+        let _ = output::emit_rows(msgs, format);
         ExitCode::from(exit::OK)
     }
 }
@@ -338,7 +426,7 @@ pub async fn dc_members(ctx: &DcCtx, guild: &str, max: u32) -> ExitCode {
     };
     match client.list_members(&guild_id, max).await {
         Ok(members) => {
-            let _ = output::emit(&members, ctx.format);
+            let _ = output::emit_rows(&members, ctx.format);
             ExitCode::from(exit::OK)
         }
         Err(e) => {
@@ -395,7 +483,7 @@ pub async fn dc_search(
         .await
     {
         Ok(msgs) => {
-            let _ = output::emit(&msgs, ctx.format);
+            let _ = output::emit_rows(&msgs, ctx.format);
             ExitCode::from(exit::OK)
         }
         Err(e) => {
@@ -417,7 +505,7 @@ pub async fn dc_roles(ctx: &DcCtx, guild: &str) -> ExitCode {
     };
     match client.list_roles(&guild_id).await {
         Ok(roles) => {
-            let _ = output::emit(&roles, ctx.format);
+            let _ = output::emit_rows(&roles, ctx.format);
             ExitCode::from(exit::OK)
         }
         Err(e) => ExitCode::from(output::emit_error("ApiError", &e.to_string(), classify(&e))),
@@ -475,7 +563,7 @@ pub async fn dc_relationships(ctx: &DcCtx) -> ExitCode {
     };
     match client.relationships().await {
         Ok(rels) => {
-            let _ = output::emit(&rels, ctx.format);
+            let _ = output::emit_rows(&rels, ctx.format);
             ExitCode::from(exit::OK)
         }
         Err(e) => ExitCode::from(output::emit_error("ApiError", &e.to_string(), classify(&e))),
@@ -494,7 +582,7 @@ pub async fn dc_threads(ctx: &DcCtx, channel: &str) -> ExitCode {
     };
     match client.list_threads(&channel_id).await {
         Ok(threads) => {
-            let _ = output::emit(&threads, ctx.format);
+            let _ = output::emit_rows(&threads, ctx.format);
             ExitCode::from(exit::OK)
         }
         Err(e) => ExitCode::from(output::emit_error("ApiError", &e.to_string(), classify(&e))),
@@ -610,9 +698,24 @@ async fn load_attachments(
         eprintln!("too many files: max {MAX_ATTACHMENTS} per message");
         return Err(ExitCode::from(exit::USAGE));
     }
-    let mut out = Vec::with_capacity(files.len());
+    // Stat+read each file concurrently (≤10 files, each capped at 10MiB) —
+    // was a serial metadata→read chain per file.
+    let mut jobs = Vec::with_capacity(files.len());
     for path in files {
-        let meta = match tokio::fs::metadata(path).await {
+        let p = path.clone();
+        jobs.push(async move {
+            let meta = tokio::fs::metadata(&p).await;
+            let data = match &meta {
+                Ok(m) if m.len() <= MAX_FILE_BYTES => Some(tokio::fs::read(&p).await),
+                _ => None,
+            };
+            (p, meta, data)
+        });
+    }
+    let results = ordered_join_all(jobs).await;
+    let mut out = Vec::with_capacity(files.len());
+    for (path, meta, data) in results {
+        let meta = match meta {
             Ok(m) => m,
             Err(e) => {
                 eprintln!("cannot read file \"{path}\": {e}");
@@ -623,18 +726,22 @@ async fn load_attachments(
             eprintln!("file too large (>10MiB): {path}");
             return Err(ExitCode::from(EXIT_ATTACHMENT));
         }
-        let data = match tokio::fs::read(path).await {
-            Ok(d) => d,
-            Err(e) => {
+        let data = match data {
+            Some(Ok(d)) => d,
+            Some(Err(e)) => {
                 eprintln!("cannot read file \"{path}\": {e}");
                 return Err(ExitCode::from(EXIT_ATTACHMENT));
             }
+            None => {
+                eprintln!("cannot read file \"{path}\"");
+                return Err(ExitCode::from(EXIT_ATTACHMENT));
+            }
         };
-        let filename = std::path::Path::new(path)
+        let filename = std::path::Path::new(&path)
             .file_name()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| path.clone());
-        let mime = mime_guess::from_path(path)
+        let mime = mime_guess::from_path(&path)
             .first_raw()
             .unwrap_or("application/octet-stream")
             .to_string();
@@ -646,6 +753,27 @@ async fn load_attachments(
         });
     }
     Ok(out)
+}
+
+/// Run async jobs to completion, yielding results IN SUBMISSION ORDER —
+/// a JoinSet + index map (avoids a futures-util dep for FuturesOrdered).
+async fn ordered_join_all<F, T>(jobs: Vec<F>) -> Vec<T>
+where
+    F: std::future::Future<Output = T> + Send + 'static,
+    T: Send + 'static,
+{
+    let mut set = tokio::task::JoinSet::new();
+    for (i, job) in jobs.into_iter().enumerate() {
+        set.spawn(async move { (i, job.await) });
+    }
+    let mut slots: Vec<Option<T>> = Vec::new();
+    slots.resize_with(set.len(), || None);
+    while let Some(joined) = set.join_next().await {
+        if let Ok((i, v)) = joined {
+            slots[i] = Some(v);
+        }
+    }
+    slots.into_iter().map(|s| s.unwrap()).collect()
 }
 
 /// Options for `dc send` (avoids clippy too_many_arguments).
@@ -934,7 +1062,7 @@ pub async fn dc_top_reactions(
     };
     match ddb::top_reacted(&conn, guild, channel, limit) {
         Ok(rows) => {
-            let _ = output::emit(&rows, ctx.format);
+            let _ = output::emit_rows(&rows, ctx.format);
             ExitCode::from(exit::OK)
         }
         Err(e) => ExitCode::from(output::emit_error("DbError", &e.to_string(), exit::ERROR)),
@@ -1163,7 +1291,7 @@ pub async fn dc_pins(ctx: &DcCtx, channel: &str) -> ExitCode {
     };
     match client.pinned_messages(&channel_id).await {
         Ok(pins) => {
-            let _ = output::emit(&pins, ctx.format);
+            let _ = output::emit_rows(&pins, ctx.format);
             ExitCode::from(exit::OK)
         }
         Err(e) => ExitCode::from(output::emit_error("ApiError", &e.to_string(), classify(&e))),
@@ -1202,36 +1330,138 @@ pub async fn dc_sync_all(ctx: &DcCtx, limit: usize) -> ExitCode {
             return ExitCode::from(output::emit_error("ApiError", &e.to_string(), classify(&e)))
         }
     };
+    // Bounded concurrency for BOTH phases: at most 3 in-flight requests
+    // total (rate-limit friendly — Discord guild/channel endpoints share
+    // per-route buckets). Each worker owns a peer ApiClient since the
+    // HTTP client is `&mut self`.
+    const MAX_IN_FLIGHT: usize = 3;
+    let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_IN_FLIGHT));
+
+    // Phase 1: discover channels per guild (was: serial list_channels).
+    let mut set = tokio::task::JoinSet::new();
+    for (i, g) in guilds.iter().enumerate() {
+        let gid = g.id.clone();
+        let mut peer = client.peer();
+        let sem = sem.clone();
+        set.spawn(async move {
+            let _permit = sem.acquire_owned().await.ok();
+            let res = peer.list_channels(&gid).await;
+            (i, res.map_err(|e| e.to_string()))
+        });
+    }
+    let mut guild_channels: Vec<Option<Result<Vec<discord_core::types::Channel>, String>>> =
+        (0..guilds.len()).map(|_| None).collect();
+    while let Some(joined) = set.join_next().await {
+        if let Ok((i, res)) = joined {
+            guild_channels[i] = Some(res);
+        }
+    }
+
+    // Flatten the work list in guild order (deterministic failure output).
+    let mut work: Vec<(usize, usize)> = Vec::new(); // (guild idx, channel idx)
+    for (i, res) in guild_channels.iter().enumerate() {
+        if let Some(Ok(chs)) = res {
+            for ci in 0..chs.len() {
+                work.push((i, ci));
+            }
+        }
+    }
+
+    // Phase 2: sync each channel (was: serial sync_channel per channel).
+    // `buffer_unordered` polls the futures on THIS task — required because
+    // `sync_channel`'s future is !Send (it holds a rusqlite Connection
+    // across network awaits), so JoinSet::spawn can't take it. Concurrency
+    // stays bounded by MAX_IN_FLIGHT.
+    use futures_util::stream::{self, StreamExt};
+    let mut results: Vec<Option<Result<usize, String>>> = (0..work.len()).map(|_| None).collect();
+    let syncs = stream::iter(work.iter().enumerate().map(|(wi, &(gi, ci))| {
+        // Channel + guild metadata were already fetched in Phase 1 —
+        // pass them through so sync skips the redundant get_channel /
+        // guild_info round-trips (guild name comes from list_guilds).
+        let (cid, name, gid, gname, ctype) = match &guild_channels[gi] {
+            Some(Ok(chs)) => {
+                let ch = &chs[ci];
+                (
+                    ch.id.clone(),
+                    ch.name.clone(),
+                    ch.guild_id.clone(),
+                    guilds[gi].name.clone(),
+                    ch.channel_type,
+                )
+            }
+            _ => (String::new(), String::new(), None, String::new(), 0),
+        };
+        let mut peer = client.peer();
+        async move {
+            if cid.is_empty() {
+                return (wi, Err("missing channel".to_string()));
+            }
+            let meta = crate::commands::sync::ChannelMeta {
+                name: &name,
+                guild_id: gid.as_deref(),
+                guild_name: Some(gname.as_str()),
+                channel_type: ctype,
+            };
+            let res = crate::commands::sync::sync_channel_meta(&mut peer, &cid, limit, &meta)
+                .await
+                .map_err(|e| e.to_string());
+            (wi, res)
+        }
+    }))
+    .buffer_unordered(MAX_IN_FLIGHT);
+    futures_util::pin_mut!(syncs);
+    while let Some((wi, res)) = syncs.next().await {
+        results[wi] = Some(res);
+    }
+
+    // Rebuild totals + failures in the original guild→channel order.
     let mut total = 0usize;
     let mut channels_synced = 0usize;
     // Per-target failures are collected and emitted — silently `continue`-ing
     // would report a partial archive as a clean success.
     let mut failures: Vec<serde_json::Value> = Vec::new();
-    for g in &guilds {
-        let channels = match client.list_channels(&g.id).await {
-            Ok(c) => c,
-            Err(e) => {
+    let mut wi = 0usize;
+    for (i, g) in guilds.iter().enumerate() {
+        match &guild_channels[i] {
+            Some(Err(e)) => {
                 failures.push(serde_json::json!({
                     "guild_id": g.id.as_str(),
                     "guild_name": g.name.as_str(),
                     "error": format!("list_channels failed: {e}"),
                 }));
-                continue;
             }
-        };
-        for ch in channels {
-            match crate::commands::sync::sync_channel(&mut client, &ch.id, limit).await {
-                Ok(n) => {
-                    total += n;
-                    channels_synced += 1;
+            Some(Ok(chs)) => {
+                for ch in chs {
+                    match &results.get(wi).and_then(|r| r.as_ref()) {
+                        Some(Ok(n)) => {
+                            total += n;
+                            channels_synced += 1;
+                        }
+                        Some(Err(e)) => {
+                            failures.push(serde_json::json!({
+                                "channel_id": ch.id,
+                                "channel_name": ch.name,
+                                "error": e,
+                            }));
+                        }
+                        // Join/task failure — surface like a sync error.
+                        None => {
+                            failures.push(serde_json::json!({
+                                "channel_id": ch.id,
+                                "channel_name": ch.name,
+                                "error": "sync worker failed",
+                            }));
+                        }
+                    }
+                    wi += 1;
                 }
-                Err(e) => {
-                    failures.push(serde_json::json!({
-                        "channel_id": ch.id,
-                        "channel_name": ch.name,
-                        "error": e.to_string(),
-                    }));
-                }
+            }
+            None => {
+                failures.push(serde_json::json!({
+                    "guild_id": g.id.as_str(),
+                    "guild_name": g.name.as_str(),
+                    "error": "list_channels worker failed",
+                }));
             }
         }
     }
@@ -1620,6 +1850,20 @@ pub async fn dc_channel_clone(
         return ExitCode::from(output::emit_error(
             "Usage",
             &format!("invalid channel name \"{clone_name}\" (1-100 chars, no '#')"),
+            exit::USAGE,
+        ));
+    }
+    // Only types Discord's guild-channel create endpoint accepts can be
+    // cloned — category (4), threads (10-12), and DM types would 400.
+    const CLONEABLE_TYPES: &[u8] = &[0, 2, 5, 13, 15, 16];
+    if !CLONEABLE_TYPES.contains(&original.channel_type) {
+        return ExitCode::from(output::emit_error(
+            "Usage",
+            &format!(
+                "cannot clone channel type {} ({})",
+                original.channel_type,
+                discord_core::types::channel_type_name(original.channel_type)
+            ),
             exit::USAGE,
         ));
     }
@@ -2091,7 +2335,7 @@ pub async fn dc_emoji_list(ctx: &DcCtx, guild: &str, count: Option<u32>) -> Exit
                 Some(n) => emojis.into_iter().take(n as usize).collect(),
                 None => emojis,
             };
-            let _ = output::emit(&out, ctx.format);
+            let _ = output::emit_rows(&out, ctx.format);
             ExitCode::from(exit::OK)
         }
         Err(e) => {
@@ -2705,7 +2949,7 @@ pub async fn dc_perm_list(ctx: &DcCtx) -> ExitCode {
         .iter()
         .map(|(name, bit)| serde_json::json!({ "name": name, "bit": bit.to_string() }))
         .collect();
-    let _ = output::emit(&rows, ctx.format);
+    let _ = output::emit_rows(&rows, ctx.format);
     ExitCode::from(exit::OK)
 }
 
@@ -2989,7 +3233,7 @@ pub async fn dc_audit_log(
                     })
                 })
                 .collect();
-            let _ = output::emit(&rows, ctx.format);
+            let _ = output::emit_rows(&rows, ctx.format);
             ExitCode::from(exit::OK)
         }
         Err(e) => {
@@ -3030,7 +3274,7 @@ pub async fn dc_audit_types(ctx: &DcCtx) -> ExitCode {
         .iter()
         .map(|(name, code)| serde_json::json!({ "name": name, "code": code }))
         .collect();
-    let _ = output::emit(&rows, ctx.format);
+    let _ = output::emit_rows(&rows, ctx.format);
     ExitCode::from(exit::OK)
 }
 
@@ -3050,7 +3294,7 @@ pub async fn dc_invite_list(ctx: &DcCtx, guild: &str) -> ExitCode {
     };
     match client.list_guild_invites(&guild_id).await {
         Ok(invites) => {
-            let _ = output::emit(&invites, ctx.format);
+            let _ = output::emit_rows(&invites, ctx.format);
             ExitCode::from(exit::OK)
         }
         Err(e) => {

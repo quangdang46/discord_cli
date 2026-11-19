@@ -11,6 +11,8 @@
 //! - Exit codes: 0 ok, 1 error, 2 usage, 3 not-found, 4 forbidden, 5 network.
 
 use std::io::{IsTerminal, Write};
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
 
@@ -118,7 +120,11 @@ pub enum Format {
 /// Write data to stdout in the chosen format.
 /// For Json/Jsonl the envelope is unwrapped: Jsonl streams the data array
 /// row-by-row (agent-friendly); Json emits a single envelope object.
-pub fn emit<T: Serialize>(data: &T, format: Format) -> std::io::Result<()> {
+///
+/// Flushes any buffered [`out_line`] output first so envelope and row
+/// output never interleave out of order.
+pub fn emit<T: Serialize + ?Sized>(data: &T, format: Format) -> std::io::Result<()> {
+    flush_out_buf();
     let stdout = std::io::stdout();
     let mut lock = stdout.lock();
     match format {
@@ -139,8 +145,29 @@ pub fn emit<T: Serialize>(data: &T, format: Format) -> std::io::Result<()> {
     }
 }
 
+/// Write a row list in the chosen format.
+///
+/// JSONL serializes each element straight to the locked stdout — one
+/// serialization pass per row instead of `to_value` on the whole result
+/// set plus a second serialize per item (~2x CPU and peak memory on large
+/// histories/searches). Other formats delegate to [`emit`] on the slice
+/// (identical envelope bytes).
+pub fn emit_rows<T: Serialize>(rows: &[T], format: Format) -> std::io::Result<()> {
+    if format != Format::Jsonl {
+        return emit(rows, format);
+    }
+    flush_out_buf();
+    let stdout = std::io::stdout();
+    let mut lock = stdout.lock();
+    for row in rows {
+        serde_json::to_writer(&mut lock, row).map_err(std::io::Error::other)?;
+        lock.write_all(b"\n")?;
+    }
+    lock.flush()
+}
+
 /// Emit a list as JSONL (one object per line). Non-list data → single line.
-fn emit_jsonl_rows<T: Serialize>(data: &T, out: &mut impl Write) -> std::io::Result<()> {
+fn emit_jsonl_rows<T: Serialize + ?Sized>(data: &T, out: &mut impl Write) -> std::io::Result<()> {
     use serde_json::Value;
     let value = serde_json::to_value(data).map_err(std::io::Error::other)?;
     match value {
@@ -160,6 +187,40 @@ fn emit_jsonl_rows<T: Serialize>(data: &T, out: &mut impl Write) -> std::io::Res
     Ok(())
 }
 
+/// Shared buffered stdout for [`out_line`]. `Stdout`'s own `LineWriter`
+/// already flushed per line; batching here cuts one write syscall per
+/// line down to one per burst while staying responsive (time- or
+/// count-based flush).
+struct OutBuf {
+    buf: std::io::BufWriter<std::io::Stdout>,
+    lines: u32,
+    last_flush: Instant,
+}
+
+const OUT_FLUSH_LINES: u32 = 32;
+const OUT_FLUSH_IDLE: Duration = Duration::from_millis(50);
+
+fn out_buf() -> &'static Mutex<OutBuf> {
+    static OUT: OnceLock<Mutex<OutBuf>> = OnceLock::new();
+    OUT.get_or_init(|| {
+        Mutex::new(OutBuf {
+            buf: std::io::BufWriter::with_capacity(16 * 1024, std::io::stdout()),
+            lines: 0,
+            last_flush: Instant::now(),
+        })
+    })
+}
+
+/// Flush buffered `out_line` output (called by [`emit`] for ordering and
+/// by `main` before exit so the tail of a stream is never lost).
+pub fn flush_out_buf() {
+    if let Ok(mut b) = out_buf().lock() {
+        let _ = b.buf.flush();
+        b.lines = 0;
+        b.last_flush = Instant::now();
+    }
+}
+
 /// Write one pre-formatted line to stdout (JSONL data, transcripts, help).
 ///
 /// EPIPE is treated as a clean early exit — piped consumers like `| head`
@@ -168,10 +229,20 @@ fn emit_jsonl_rows<T: Serialize>(data: &T, out: &mut impl Write) -> std::io::Res
 /// this CLI and errors already have a dedicated channel (`emit_error` →
 /// stderr). Use this for every data line instead of `println!`.
 pub fn out_line(line: &str) {
-    let stdout = std::io::stdout();
-    let mut lock = stdout.lock();
-    let _ = writeln!(lock, "{}", line);
-    let _ = lock.flush();
+    let Ok(mut b) = out_buf().lock() else {
+        return;
+    };
+    if writeln!(b.buf, "{}", line).is_err() {
+        // Pipe closed / IO error: drop buffered state like a clean exit.
+        let _ = b.buf.flush();
+        return;
+    }
+    b.lines += 1;
+    if b.lines >= OUT_FLUSH_LINES || b.last_flush.elapsed() >= OUT_FLUSH_IDLE {
+        let _ = b.buf.flush();
+        b.lines = 0;
+        b.last_flush = Instant::now();
+    }
 }
 
 /// Write a progress/status message to stderr (never stdout).

@@ -116,6 +116,11 @@ fn parse_mcp_since(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
             .and_hms_opt(0, 0, 0)
             .map(|t| chrono::DateTime::from_naive_utc_and_offset(t, chrono::Utc));
     }
+    // Guard the split: `len()-1` is not a char boundary when the input ends
+    // in a multibyte codepoint (e.g. "café").
+    if !s.is_char_boundary(s.len().saturating_sub(1)) {
+        return None;
+    }
     let (num, unit) = s.split_at(s.len().saturating_sub(1));
     let n: i64 = num.parse().ok()?;
     if n <= 0 {
@@ -663,7 +668,37 @@ pub struct DiscordMcpServer {
     /// resolution hit the OS keyring (D-Bus/Keychain IPC) on every single
     /// tool invocation — a real latency cost inside the async runtime.
     token: Result<String, String>,
+    /// Shared API client behind a mutex: `with_token` is cheap, but the
+    /// lazily-built inner HTTP client (TLS session, super-properties) was
+    /// reconstructed on EVERY tool call. One client per server process;
+    /// the mutex also serializes calls, which is rate-limit friendly.
+    client: std::sync::Arc<tokio::sync::Mutex<Option<ApiClient>>>,
+    /// Short-TTL cache for the hot read-only list endpoints
+    /// (list_guilds / list_channels): agents poll these repeatedly.
+    cache: std::sync::Arc<
+        tokio::sync::Mutex<std::collections::HashMap<String, (std::time::Instant, String)>>,
+    >,
 }
+
+/// Mutex guard dereffing to the shared [`ApiClient`] — call sites keep
+/// their `c.method()` shape.
+pub struct ClientGuard<'a>(tokio::sync::MutexGuard<'a, Option<ApiClient>>);
+
+impl std::ops::Deref for ClientGuard<'_> {
+    type Target = ApiClient;
+    fn deref(&self) -> &ApiClient {
+        self.0.as_ref().expect("client initialized")
+    }
+}
+
+impl std::ops::DerefMut for ClientGuard<'_> {
+    fn deref_mut(&mut self) -> &mut ApiClient {
+        self.0.as_mut().expect("client initialized")
+    }
+}
+
+/// TTL for the list-endpoint cache (guild/channel lists change rarely).
+const LIST_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
 
 impl DiscordMcpServer {
     pub fn new(token: Option<String>) -> Self {
@@ -672,16 +707,36 @@ impl DiscordMcpServer {
         Self {
             tool_router: Self::tool_router(),
             token: resolved,
+            client: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
+            cache: std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         }
     }
 
-    fn client(&self) -> Result<ApiClient, String> {
-        // `with_token` is cheap: the HTTP client (and its super-properties)
-        // is built lazily on first request, and `device_id()` is now a
-        // stable read-first file lookup — no per-call keyring or UUID churn.
-        Ok(ApiClient::with_token(
-            self.token.clone().map_err(|e| e.clone())?,
-        ))
+    async fn client(&self) -> Result<ClientGuard<'_>, String> {
+        let mut slot = self.client.lock().await;
+        if slot.is_none() {
+            *slot = Some(ApiClient::with_token(
+                self.token.clone().map_err(|e| e.clone())?,
+            ));
+        }
+        Ok(ClientGuard(slot))
+    }
+
+    /// Cached-JSON helper for the list endpoints: returns the serialized
+    /// payload from a ≤30s-old cache entry when present.
+    async fn cached_json(&self, key: &str) -> Option<String> {
+        let cache = self.cache.lock().await;
+        cache
+            .get(key)
+            .filter(|(t, _)| t.elapsed() < LIST_CACHE_TTL)
+            .map(|(_, s)| s.clone())
+    }
+
+    async fn store_json(&self, key: &str, value: String) {
+        self.cache
+            .lock()
+            .await
+            .insert(key.to_string(), (std::time::Instant::now(), value));
     }
 }
 
@@ -696,9 +751,14 @@ impl DiscordMcpServer {
     /// List all Discord servers the user belongs to.
     #[tool(description = "List all Discord servers (guilds) the logged-in user belongs to.")]
     pub async fn list_guilds(&self, _params: Parameters<EmptyParams>) -> Result<String, String> {
-        let mut c = self.client()?;
+        if let Some(hit) = self.cached_json("guilds").await {
+            return Ok(hit);
+        }
+        let mut c = self.client().await?;
         let guilds = c.list_guilds().await.map_err(|e| e.to_string())?;
-        Ok(serde_json::to_string(&guilds).unwrap_or_else(|_| "[]".into()))
+        let out = serde_json::to_string(&guilds).unwrap_or_else(|_| "[]".into());
+        self.store_json("guilds", out.clone()).await;
+        Ok(out)
     }
 
     /// List text channels of a guild.
@@ -707,18 +767,24 @@ impl DiscordMcpServer {
         &self,
         Parameters(req): Parameters<GuildParams>,
     ) -> Result<String, String> {
-        let mut c = self.client()?;
+        let key = format!("channels:{}", req.guild_id);
+        if let Some(hit) = self.cached_json(&key).await {
+            return Ok(hit);
+        }
+        let mut c = self.client().await?;
         let channels = c
             .list_channels(&req.guild_id)
             .await
             .map_err(|e| e.to_string())?;
-        Ok(serde_json::to_string(&channels).unwrap_or_else(|_| "[]".into()))
+        let out = serde_json::to_string(&channels).unwrap_or_else(|_| "[]".into());
+        self.store_json(&key, out.clone()).await;
+        Ok(out)
     }
 
     /// List DM and group-DM channels.
     #[tool(description = "List DM and group-DM channels of the user.")]
     pub async fn list_dms(&self, _params: Parameters<EmptyParams>) -> Result<String, String> {
-        let mut c = self.client()?;
+        let mut c = self.client().await?;
         let dms = c.list_dms().await.map_err(|e| e.to_string())?;
         Ok(serde_json::to_string(&dms).unwrap_or_else(|_| "[]".into()))
     }
@@ -729,7 +795,7 @@ impl DiscordMcpServer {
         &self,
         Parameters(req): Parameters<ReadParams>,
     ) -> Result<String, String> {
-        let mut c = self.client()?;
+        let mut c = self.client().await?;
         let limit = req.limit.unwrap_or(50) as usize;
         let before = parse_snowflake_opt(req.before.as_deref(), "before")?;
         let msgs = c
@@ -752,7 +818,7 @@ impl DiscordMcpServer {
         &self,
         Parameters(req): Parameters<SendParams>,
     ) -> Result<String, String> {
-        let mut c = self.client()?;
+        let mut c = self.client().await?;
         let id = match req.files.as_deref() {
             None => c
                 .send_message(
@@ -768,14 +834,21 @@ impl DiscordMcpServer {
                 // Server-local attachment load (same caps as CLI: 10 files, 10MiB).
                 let mut atts = Vec::with_capacity(paths.len());
                 for path in paths {
+                    // Stat before reading: attachments can be huge, and
+                    // reading first would OOM the server before the 10MiB
+                    // cap could reject it (mirrors the CLI's metadata-first
+                    // check in dc.rs load_attachments).
+                    let meta = tokio::fs::metadata(path)
+                        .await
+                        .map_err(|e| format!("cannot read file \"{path}\": {e}"))?;
+                    if meta.len() > 10 * 1024 * 1024 {
+                        return Err(format!("file too large (>10MiB): {path}"));
+                    }
                     // Async fs: attachments can be up to 10MiB each — a
                     // blocking std::fs::read here would stall the executor.
                     let data = tokio::fs::read(path)
                         .await
                         .map_err(|e| format!("cannot read file \"{path}\": {e}"))?;
-                    if data.len() > 10 * 1024 * 1024 {
-                        return Err(format!("file too large (>10MiB): {path}"));
-                    }
                     let filename = std::path::Path::new(path)
                         .file_name()
                         .map(|s| s.to_string_lossy().into_owned())
@@ -815,7 +888,7 @@ impl DiscordMcpServer {
         &self,
         Parameters(req): Parameters<SearchParams>,
     ) -> Result<String, String> {
-        let mut c = self.client()?;
+        let mut c = self.client().await?;
         let limit = req.limit.unwrap_or(25);
         let msgs = c
             .search_guild_messages(&req.guild_id, &req.query, None, limit)
@@ -906,7 +979,7 @@ impl DiscordMcpServer {
         &self,
         Parameters(req): Parameters<ThreadCreateParams>,
     ) -> Result<String, String> {
-        let mut c = self.client()?;
+        let mut c = self.client().await?;
         let result = match req.message_id.as_deref() {
             Some(mid) => c
                 .create_thread_from_message(&req.channel_id, mid, &req.name, req.archive)
@@ -970,7 +1043,7 @@ impl DiscordMcpServer {
             Some(c) => c.to_string(),
             None => return Err(format!("invalid invite: {}", req.invite_code)),
         };
-        let mut c = self.client()?;
+        let mut c = self.client().await?;
         // Preview first, then accept (satisfies the {guild_name,members} contract).
         let info = c.get_invite(&code).await.map_err(|e| e.to_string())?;
         let guild_name = info
@@ -1000,7 +1073,7 @@ impl DiscordMcpServer {
         if !req.confirm {
             return Err("leave_guild requires confirm: true".into());
         }
-        let mut c = self.client()?;
+        let mut c = self.client().await?;
         c.leave_guild(&req.guild_id)
             .await
             .map_err(|e| e.to_string())?;
@@ -1013,7 +1086,7 @@ impl DiscordMcpServer {
         &self,
         Parameters(req): Parameters<GetMessageParams>,
     ) -> Result<String, String> {
-        let mut c = self.client()?;
+        let mut c = self.client().await?;
         let msg = c
             .get_message(&req.channel_id, &req.message_id)
             .await
@@ -1027,7 +1100,7 @@ impl DiscordMcpServer {
         &self,
         Parameters(req): Parameters<EditMessageParams>,
     ) -> Result<String, String> {
-        let mut c = self.client()?;
+        let mut c = self.client().await?;
         c.edit_message(&req.channel_id, &req.message_id, &req.content)
             .await
             .map_err(|e| e.to_string())?;
@@ -1045,7 +1118,7 @@ impl DiscordMcpServer {
         if !req.confirm {
             return Err("delete_message requires confirm: true".into());
         }
-        let mut c = self.client()?;
+        let mut c = self.client().await?;
         c.delete_message(&req.channel_id, &req.message_id)
             .await
             .map_err(|e| e.to_string())?;
@@ -1058,7 +1131,7 @@ impl DiscordMcpServer {
         &self,
         Parameters(req): Parameters<ReactParams>,
     ) -> Result<String, String> {
-        let mut c = self.client()?;
+        let mut c = self.client().await?;
         c.add_reaction(&req.channel_id, &req.message_id, &req.emoji)
             .await
             .map_err(|e| e.to_string())?;
@@ -1071,7 +1144,7 @@ impl DiscordMcpServer {
         &self,
         Parameters(req): Parameters<ReactParams>,
     ) -> Result<String, String> {
-        let mut c = self.client()?;
+        let mut c = self.client().await?;
         c.remove_reaction(&req.channel_id, &req.message_id, &req.emoji)
             .await
             .map_err(|e| e.to_string())?;
@@ -1084,7 +1157,7 @@ impl DiscordMcpServer {
         &self,
         Parameters(req): Parameters<PinParams>,
     ) -> Result<String, String> {
-        let mut c = self.client()?;
+        let mut c = self.client().await?;
         c.pin_message(&req.channel_id, &req.message_id)
             .await
             .map_err(|e| e.to_string())?;
@@ -1097,7 +1170,7 @@ impl DiscordMcpServer {
         &self,
         Parameters(req): Parameters<ChannelParams>,
     ) -> Result<String, String> {
-        let mut c = self.client()?;
+        let mut c = self.client().await?;
         c.trigger_typing(&req.channel_id)
             .await
             .map_err(|e| e.to_string())?;
@@ -1110,7 +1183,7 @@ impl DiscordMcpServer {
         &self,
         Parameters(req): Parameters<MembersParams>,
     ) -> Result<String, String> {
-        let mut c = self.client()?;
+        let mut c = self.client().await?;
         let members = c
             .list_members(&req.guild_id, req.limit.unwrap_or(50))
             .await
@@ -1124,7 +1197,7 @@ impl DiscordMcpServer {
         &self,
         Parameters(req): Parameters<ThreadsParams>,
     ) -> Result<String, String> {
-        let mut c = self.client()?;
+        let mut c = self.client().await?;
         let threads = c
             .list_threads(&req.channel_id)
             .await
@@ -1179,7 +1252,7 @@ impl DiscordMcpServer {
         if req.slowmode.is_some_and(|s| s > 21_600) {
             return Err("invalid slowmode (0-21600)".into());
         }
-        let mut c = self.client()?;
+        let mut c = self.client().await?;
         let mut cr = discord_user::types::CreateChannelRequest::new(&req.name);
         cr.channel_type = Some(ctype);
         cr.parent_id = req.category_id.clone();
@@ -1218,7 +1291,7 @@ impl DiscordMcpServer {
                 })?,
             ),
         };
-        let mut c = self.client()?;
+        let mut c = self.client().await?;
         let er = discord_user::types::EditChannelRequest {
             name: req.name.clone(),
             topic: req.topic.clone(),
@@ -1244,7 +1317,7 @@ impl DiscordMcpServer {
         if !req.confirm {
             return Err("delete_channel requires confirm: true".into());
         }
-        let mut c = self.client()?;
+        let mut c = self.client().await?;
         c.delete_channel(&req.channel_id)
             .await
             .map_err(|e| e.to_string())?;
@@ -1257,7 +1330,7 @@ impl DiscordMcpServer {
         &self,
         Parameters(req): Parameters<ListRolesParams>,
     ) -> Result<String, String> {
-        let mut c = self.client()?;
+        let mut c = self.client().await?;
         let roles = c
             .list_roles(&req.guild_id)
             .await
@@ -1287,7 +1360,7 @@ impl DiscordMcpServer {
             ),
             None => None,
         };
-        let mut c = self.client()?;
+        let mut c = self.client().await?;
         let rr = discord_user::types::CreateRoleRequest {
             name: Some(req.name.clone()),
             color,
@@ -1320,7 +1393,7 @@ impl DiscordMcpServer {
             ),
             None => None,
         };
-        let mut c = self.client()?;
+        let mut c = self.client().await?;
         let rr = discord_user::types::CreateRoleRequest {
             name: req.name.clone(),
             color,
@@ -1344,7 +1417,7 @@ impl DiscordMcpServer {
         if !req.confirm {
             return Err("delete_role requires confirm: true".into());
         }
-        let mut c = self.client()?;
+        let mut c = self.client().await?;
         c.delete_role(&req.guild_id, &req.role_id)
             .await
             .map_err(|e| e.to_string())?;
@@ -1357,7 +1430,7 @@ impl DiscordMcpServer {
         &self,
         Parameters(req): Parameters<RoleMemberParams>,
     ) -> Result<String, String> {
-        let mut c = self.client()?;
+        let mut c = self.client().await?;
         c.add_member_role(&req.guild_id, &req.user_id, &req.role_id)
             .await
             .map_err(|e| e.to_string())?;
@@ -1370,7 +1443,7 @@ impl DiscordMcpServer {
         &self,
         Parameters(req): Parameters<RoleMemberParams>,
     ) -> Result<String, String> {
-        let mut c = self.client()?;
+        let mut c = self.client().await?;
         c.remove_member_role(&req.guild_id, &req.user_id, &req.role_id)
             .await
             .map_err(|e| e.to_string())?;
@@ -1383,7 +1456,7 @@ impl DiscordMcpServer {
         &self,
         Parameters(req): Parameters<GuildEmojiParams>,
     ) -> Result<String, String> {
-        let mut c = self.client()?;
+        let mut c = self.client().await?;
         let emojis = c
             .list_emojis(&req.guild_id)
             .await
@@ -1403,7 +1476,7 @@ impl DiscordMcpServer {
                 req.name
             ));
         }
-        let mut c = self.client()?;
+        let mut c = self.client().await?;
         let emoji = c
             .create_emoji(&req.guild_id, &req.name, &req.file_path)
             .await
@@ -1420,7 +1493,7 @@ impl DiscordMcpServer {
         if !req.confirm {
             return Err("delete_emoji requires confirm: true".into());
         }
-        let mut c = self.client()?;
+        let mut c = self.client().await?;
         c.delete_emoji(&req.guild_id, &req.emoji_id)
             .await
             .map_err(|e| e.to_string())?;
@@ -1438,7 +1511,7 @@ impl DiscordMcpServer {
         if !req.confirm {
             return Err("kick_member requires confirm: true".into());
         }
-        let mut c = self.client()?;
+        let mut c = self.client().await?;
         c.kick_member(&req.guild_id, &req.user_id, req.reason.as_deref())
             .await
             .map_err(|e| e.to_string())?;
@@ -1459,7 +1532,7 @@ impl DiscordMcpServer {
         if req.delete_message_days.is_some_and(|d| d > 7) {
             return Err("delete_message_days must be 0-7".into());
         }
-        let mut c = self.client()?;
+        let mut c = self.client().await?;
         c.ban_member(
             &req.guild_id,
             &req.user_id,
@@ -1482,7 +1555,7 @@ impl DiscordMcpServer {
         if !req.confirm {
             return Err("unban_member requires confirm: true".into());
         }
-        let mut c = self.client()?;
+        let mut c = self.client().await?;
         c.unban_member(&req.guild_id, &req.user_id)
             .await
             .map_err(|e| e.to_string())?;
@@ -1497,7 +1570,7 @@ impl DiscordMcpServer {
         &self,
         Parameters(req): Parameters<SetNicknameParams>,
     ) -> Result<String, String> {
-        let mut c = self.client()?;
+        let mut c = self.client().await?;
         // Empty nickname → Some("") so the field is SENT and Discord clears
         // it (Some("") clears; None would omit the field and be a no-op).
         let nick = if req.nickname.is_empty() {
@@ -1519,7 +1592,7 @@ impl DiscordMcpServer {
         &self,
         Parameters(req): Parameters<ViewOverwritesParams>,
     ) -> Result<String, String> {
-        let mut c = self.client()?;
+        let mut c = self.client().await?;
         let overwrites = c
             .get_channel_overwrites(&req.channel_id)
             .await
@@ -1551,7 +1624,7 @@ impl DiscordMcpServer {
             Some(names) => ApiClient::parse_permission_names(names).map_err(|e| e.to_string())?,
             None => 0,
         };
-        let mut c = self.client()?;
+        let mut c = self.client().await?;
         c.edit_channel_permission(&req.channel_id, &overwrite_id, allow, deny, kind)
             .await
             .map_err(|e| e.to_string())?;
@@ -1576,7 +1649,7 @@ impl DiscordMcpServer {
         if !req.confirm {
             return Err("lock_channel requires confirm: true".into());
         }
-        let mut c = self.client()?;
+        let mut c = self.client().await?;
         c.lock_channel(&req.channel_id, &req.guild_id)
             .await
             .map_err(|e| e.to_string())?;
@@ -1594,7 +1667,7 @@ impl DiscordMcpServer {
         if !req.confirm {
             return Err("unlock_channel requires confirm: true".into());
         }
-        let mut c = self.client()?;
+        let mut c = self.client().await?;
         c.unlock_channel(&req.channel_id, &req.guild_id)
             .await
             .map_err(|e| e.to_string())?;
@@ -1648,7 +1721,7 @@ impl DiscordMcpServer {
             rules_channel_id: req.rules_channel.clone(),
             ..Default::default()
         };
-        let mut c = self.client()?;
+        let mut c = self.client().await?;
         let guild = c
             .edit_guild(&req.guild_id, guild_req)
             .await
@@ -1677,7 +1750,7 @@ impl DiscordMcpServer {
             ),
             None => None,
         };
-        let mut c = self.client()?;
+        let mut c = self.client().await?;
         let log = c
             .audit_logs(&req.guild_id, user_id, action_type, req.limit)
             .await
@@ -1745,7 +1818,7 @@ impl DiscordMcpServer {
         &self,
         Parameters(req): Parameters<ListInvitesParams>,
     ) -> Result<String, String> {
-        let mut c = self.client()?;
+        let mut c = self.client().await?;
         let invites = c
             .list_guild_invites(&req.guild_id)
             .await
@@ -1761,7 +1834,7 @@ impl DiscordMcpServer {
         &self,
         Parameters(req): Parameters<CreateInviteParams>,
     ) -> Result<String, String> {
-        let mut c = self.client()?;
+        let mut c = self.client().await?;
         let inv_req = discord_user::types::CreateInviteRequest {
             max_age: req.max_age,
             max_uses: req.max_uses,
@@ -1785,7 +1858,7 @@ impl DiscordMcpServer {
         if !req.confirm {
             return Err("delete_invite requires confirm: true".into());
         }
-        let mut c = self.client()?;
+        let mut c = self.client().await?;
         c.delete_invite(&req.code)
             .await
             .map_err(|e| e.to_string())?;
@@ -1832,7 +1905,7 @@ impl DiscordMcpServer {
             reply_to: req.reply_to.clone(),
         };
         discord_core::types::validate_embed(&spec).map_err(|e| e.to_string())?;
-        let mut c = self.client()?;
+        let mut c = self.client().await?;
         let msg = c
             .send_embed(&req.channel_id, spec)
             .await

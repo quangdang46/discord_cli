@@ -133,9 +133,15 @@ pub fn resolve_token(flag: Option<&str>) -> Result<String> {
 }
 
 /// Read token from OS keyring (service `discord-cli`, user `token`).
+/// `NoEntry` → empty (not enrolled); real keyring errors propagate instead
+/// of being masked as "no token" by `unwrap_or_default`.
 pub fn keyring_token() -> Result<String> {
     let entry = keyring::Entry::new(APP_NAME, "token")?;
-    Ok(entry.get_password().unwrap_or_default())
+    match entry.get_password() {
+        Ok(t) => Ok(t),
+        Err(keyring::Error::NoEntry) => Ok(String::new()),
+        Err(e) => Err(e.into()),
+    }
 }
 
 /// Save token to OS keyring.
@@ -172,8 +178,10 @@ pub fn device_id() -> Result<String> {
     // processes starting in the same nanosecond cannot collide; the
     // wall-clock-based generator that preceded this could.
     let id = {
-        let hex = uuid::Uuid::new_v4().as_u128() as u32; // low 32 bits
-        format!("discord-cli-{:03x}", hex % 0x1000)
+        // Low 64 bits of the v4 UUID → 16 hex chars. The old `% 0x1000`
+        // truncation left only 4096 values (~77-install birthday collisions).
+        let hex = uuid::Uuid::new_v4().as_u128() as u64;
+        format!("discord-cli-{hex:016x}")
     };
     if std::fs::write(&path, &id).is_err() {
         // The data dir is not writable — return the generated value anyway
@@ -183,14 +191,15 @@ pub fn device_id() -> Result<String> {
     Ok(id)
 }
 
-/// Shape check for a persisted device id: `discord-cli-` + exactly 3 hex
-/// digits. Anything else (empty, truncated, foreign format) is treated as
-/// missing and regenerated.
+/// Shape check for a persisted device id: `discord-cli-` + 3–16 hex
+/// digits (3 = legacy ids, 16 = current u64 entropy). Anything else
+/// (empty, truncated, foreign format) is treated as missing and
+/// regenerated.
 fn is_valid_device_id(v: &str) -> bool {
     let Some(hex) = v.strip_prefix("discord-cli-") else {
         return false;
     };
-    hex.len() == 3 && hex.chars().all(|c| c.is_ascii_hexdigit())
+    (3..=16).contains(&hex.len()) && hex.chars().all(|c| c.is_ascii_hexdigit())
 }
 
 /// Config file for per-install settings (presence, etc.).
@@ -362,12 +371,12 @@ mod tests {
             let tmp = std::env::temp_dir().join(unique);
             std::env::set_var("DATA_DIR", &tmp);
             std::fs::create_dir_all(&tmp).unwrap();
-            // Malformed (8 hex chars, not the 3-hex contract) → regenerated.
-            std::fs::write(tmp.join("device_id"), "discord-cli-deadbeef").unwrap();
+            // Malformed (non-hex chars) → regenerated.
+            std::fs::write(tmp.join("device_id"), "discord-cli-xyz!!").unwrap();
             let id = device_id().unwrap();
             assert!(id.starts_with("discord-cli-"), "prefix: {id}");
             assert_ne!(
-                id, "discord-cli-deadbeef",
+                id, "discord-cli-xyz!!",
                 "malformed file must be regenerated"
             );
             assert!(valid_device_id(&id), "format: {id}");

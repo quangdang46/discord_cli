@@ -41,31 +41,45 @@ pub fn cmd_search(
             return ExitCode::from(output::emit_error("DbError", &e.to_string(), exit::ERROR))
         }
     };
-    // Basic per-channel filter is applied post-hoc (query is FTS5-native).
-    match ddb::search_messages(&conn, query, limit as i64) {
+    // Channel/author/since predicates go into SQL so `LIMIT` applies AFTER
+    // filtering (post-hoc retain on a pre-limited page could under-fill).
+    // `--since` cutoff is validated BEFORE the query so a bad value is a
+    // usage error, not silently ignored.
+    let since_cutoff_str = match since {
+        Some(s) => match since_cutoff(s) {
+            Some(c) => Some(c),
+            None => {
+                return ExitCode::from(output::emit_error(
+                    "UsageError",
+                    &format!("invalid --since: \"{s}\" (use 12h|30d|YYYY-MM-DD)"),
+                    exit::USAGE,
+                ))
+            }
+        },
+        None => None,
+    };
+    let filter = ddb::SearchFilter {
+        channel: channel.map(|c| c.to_string()),
+        author: author.map(|a| a.to_string()),
+        since: since_cutoff_str,
+    };
+    match ddb::search_messages_filtered(&conn, query, &filter, limit as i64) {
         Ok(mut hits) => {
+            // Exact post-filter kept as a safety net: the SQL LIKE is
+            // ASCII-case-insensitive while the original predicate was a
+            // Unicode `to_lowercase().contains()` — hits ≤ limit, cheap.
             if let Some(ch) = channel {
-                hits.retain(|h| h.channel_name.to_lowercase().contains(&ch.to_lowercase()));
+                let ch_lower = ch.to_lowercase();
+                hits.retain(|h| h.channel_name.to_lowercase().contains(&ch_lower));
             }
             if let Some(a) = author {
-                let a = a.to_lowercase();
-                hits.retain(|h| h.author_name.to_lowercase().contains(&a));
+                let a_lower = a.to_lowercase();
+                hits.retain(|h| h.author_name.to_lowercase().contains(&a_lower));
             }
-            if let Some(s) = since {
-                // RFC3339 string compare: stored timestamps are UTC `Z` strings,
-                // the naive-UTC cutoff is lexically comparable (download.rs).
-                match since_cutoff(s) {
-                    Some(cutoff) => hits.retain(|h| h.timestamp >= cutoff),
-                    None => {
-                        return ExitCode::from(output::emit_error(
-                            "UsageError",
-                            &format!("invalid --since: \"{s}\" (use 12h|30d|YYYY-MM-DD)"),
-                            exit::USAGE,
-                        ))
-                    }
-                }
+            if let Some(cutoff) = &filter.since {
+                hits.retain(|h| h.timestamp >= *cutoff);
             }
-            let _ = output::emit(&hits, format);
+            let _ = output::emit_rows(&hits, format);
             ExitCode::from(exit::OK)
         }
         Err(e) => ExitCode::from(output::emit_error("DbError", &e.to_string(), exit::ERROR)),
@@ -93,6 +107,15 @@ pub fn cmd_recent(
             return ExitCode::from(output::emit_error("DbError", &e.to_string(), exit::ERROR))
         }
     };
+    if let Some(h) = hours {
+        if h <= 0 {
+            return ExitCode::from(output::emit_error(
+                "UsageError",
+                "--hours must be a positive integer",
+                exit::USAGE,
+            ));
+        }
+    }
     // SQL-level `--hours` (recent_messages) + post-hoc `--since` filter.
     let mut hits = match ddb::recent_messages(&conn, channel, hours, limit as i64) {
         Ok(h) => h,
@@ -114,7 +137,7 @@ pub fn cmd_recent(
             }
         }
     }
-    let _ = output::emit(&hits, format);
+    let _ = output::emit_rows(&hits, format);
     ExitCode::from(exit::OK)
 }
 
@@ -144,15 +167,17 @@ pub fn cmd_today(format: Format) -> ExitCode {
         .date_naive()
         .and_hms_opt(0, 0, 0)
         .map(|local_midnight| {
-            let offset_min = chrono::Local::now().offset().local_minus_utc();
-            (local_midnight - chrono::Duration::minutes(offset_min as i64))
+            // `local_minus_utc()` returns SECONDS (not minutes); using the
+            // wrong unit mis-cuts the local day everywhere except UTC.
+            let offset_sec = chrono::Local::now().offset().local_minus_utc();
+            (local_midnight - chrono::Duration::seconds(offset_sec as i64))
                 .format("%Y-%m-%dT%H:%M:%S")
                 .to_string()
         });
     match cutoff {
         Some(c) => match ddb::today_messages(&conn, &c, 50) {
             Ok(stats) => {
-                let _ = output::emit(&stats, format);
+                let _ = output::emit_rows(&stats, format);
                 ExitCode::from(exit::OK)
             }
             Err(e) => ExitCode::from(output::emit_error("DbError", &e.to_string(), exit::ERROR)),
@@ -195,7 +220,7 @@ pub fn cmd_timeline(by: &str, format: Format) -> ExitCode {
                     output::out_line(&format!("{} {bar} {}", b.bucket, b.count));
                 }
             } else {
-                let _ = output::emit(&buckets, format);
+                let _ = output::emit_rows(&buckets, format);
             }
             ExitCode::from(exit::OK)
         }
@@ -219,7 +244,7 @@ pub fn cmd_stats(format: Format) -> ExitCode {
     };
     match ddb::channel_stats(&conn) {
         Ok(stats) => {
-            let _ = output::emit(&stats, format);
+            let _ = output::emit_rows(&stats, format);
             ExitCode::from(exit::OK)
         }
         Err(e) => ExitCode::from(output::emit_error("DbError", &e.to_string(), exit::ERROR)),
@@ -344,7 +369,7 @@ pub fn cmd_top(channel: Option<&str>, limit: usize, format: Format) -> ExitCode 
     };
     match ddb::top_senders(&conn, channel, limit as i64) {
         Ok(senders) => {
-            let _ = output::emit(&senders, format);
+            let _ = output::emit_rows(&senders, format);
             ExitCode::from(exit::OK)
         }
         Err(e) => ExitCode::from(output::emit_error("DbError", &e.to_string(), exit::ERROR)),

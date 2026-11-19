@@ -68,6 +68,13 @@ impl ApiClient {
         Ok(Self::with_token(resolve_token(flag)?))
     }
 
+    /// Cheap peer for bounded fan-out: shares the token but owns a separate
+    /// HTTP client (rate-limit/connection state is per-client). Callers must
+    /// cap concurrency — never spawn one peer per guild unbounded.
+    pub fn peer(&self) -> Self {
+        Self::with_token(self.token.clone())
+    }
+
     /// Lazily build the underlying HTTP client (Chrome UA, locale, super-props).
     /// Under `cfg(test)` the client is constructed without super-properties:
     /// building them calls `device_id()`, which mutates the process-global
@@ -210,6 +217,26 @@ impl ApiClient {
         let mut channels: Vec<Channel> = raw.into_iter().map(crate_channel_to_workspace).collect();
         channels.sort_by_key(|c| c.position.unwrap_or(0));
         Ok(channels)
+    }
+
+    /// `GET /guilds/{id}/channels` — `(id, name)` pairs for EVERY channel
+    /// type, deserialized through the lightweight `RawChannel` shape (no
+    /// permission_overwrites/topic allocation). Used by name→ID resolution,
+    /// which only needs names — not the full `Channel` payload.
+    pub async fn guild_channel_names(&mut self, guild_id: &str) -> Result<Vec<(String, String)>> {
+        let gid: u64 = guild_id.parse().context("invalid guild id")?;
+        let inner = self.inner()?;
+        let mut raw: Vec<RawChannel> = inner
+            .get(Route::GetGuildChannels { guild_id: gid })
+            .await
+            .context("GET /guilds/{id}/channels (names) failed")?;
+        // Keep the same position ordering as `get_guild_channels_all` so
+        // first-match resolution is deterministic.
+        raw.sort_by_key(|c| c.position);
+        Ok(raw
+            .into_iter()
+            .map(|c| (c.id, c.name.unwrap_or_default()))
+            .collect())
     }
 
     /// `POST /guilds/{id}/channels` — create a guild channel.
@@ -380,8 +407,14 @@ impl ApiClient {
             .await
             .context("search failed")?;
         let mut out = Vec::new();
-        for group in raw.messages {
+        'groups: for group in raw.messages {
             for msg in group {
+                // Stop converting once `limit` is hit — the API groups
+                // results and a full trailing group would otherwise
+                // overshoot the requested count.
+                if out.len() >= limit as usize {
+                    break 'groups;
+                }
                 let urls = msg.url_list();
                 let details = msg.details();
                 let reactions = msg.reaction_total();
@@ -1019,7 +1052,9 @@ impl ApiClient {
             .get(Route::GetMe)
             .await
             .context("GET /users/@me failed")?;
-        if me.id != user_id {
+        // Compare numerically: a string compare breaks on non-canonical
+        // ids (e.g. a leading-zero user_id that parses to the same u64).
+        if me.id.parse::<u64>().ok() != Some(uid) {
             anyhow::bail!(
                 "GET /users/{{id}} is restricted to the current user on user tokens (40001); use `discord userinfo <your-id>` or `discord profile`"
             );
@@ -1812,6 +1847,10 @@ impl ApiClient {
     ) -> Result<Vec<crate::types::Message>> {
         let cid: u64 = channel_id.parse().context("invalid channel id")?;
         let inner = self.inner()?;
+        // Discord rejects a request carrying both `before` and `after`
+        // cursors — when both are set, `before` wins and `after` is
+        // dropped (callers needing the lower bound re-apply it themselves).
+        let after = if before.is_some() { None } else { after };
         let mut all: Vec<RawMessage> = Vec::new();
         // No artificial cap: `limit` is honored in full (sync's documented
         // default is 5000). Discord caps each request at 100 messages, so
@@ -1853,7 +1892,12 @@ impl ApiClient {
         }
 
         // Sort ascending by id (jackwener sorts by msg_id ascending).
-        all.sort_by_key(|m| m.id.clone());
+        // Snowflakes are fixed-width numerics — compare as u64 (lexical
+        // fallback for non-numeric) instead of cloning every id as a key.
+        all.sort_unstable_by(|a, b| match (a.id.parse::<u64>(), b.id.parse::<u64>()) {
+            (Ok(x), Ok(y)) => x.cmp(&y),
+            _ => a.id.cmp(&b.id),
+        });
         Ok(all
             .into_iter()
             .map(|m| {
@@ -1882,7 +1926,7 @@ fn randish() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     let n = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap()
+        .unwrap_or_default() // clock < 1970 → 0 jitter, never panic
         .subsec_nanos() as u64;
     n % 400
 }

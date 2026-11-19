@@ -26,7 +26,11 @@ pub(crate) fn parse_since(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
             .and_hms_opt(0, 0, 0)
             .map(|t| chrono::DateTime::from_naive_utc_and_offset(t, chrono::Utc));
     }
-    // <n><d|m|y|h> relative.
+    // <n><d|m|y|h> relative. Guard the split: `len()-1` is not a char
+    // boundary when the input ends in a multibyte codepoint (e.g. "café").
+    if !s.is_char_boundary(s.len().saturating_sub(1)) {
+        return None;
+    }
     let (num, unit) = s.split_at(s.len().saturating_sub(1));
     let n: i64 = num.parse().ok()?;
     if n <= 0 {
@@ -90,11 +94,9 @@ pub(crate) fn safe_filename(name: &str) -> String {
 pub(crate) const MAX_DOWNLOAD_BYTES: u64 = 256 * 1024 * 1024; // 256 MiB
 
 /// Download a single attachment (plain GET with browser UA). Returns bytes.
-async fn fetch_attachment(url: &str) -> Result<Vec<u8>> {
-    let client = reqwest::Client::builder()
-        .user_agent(discord_core::stealth::browser_user_agent())
-        .timeout(std::time::Duration::from_secs(30))
-        .build()?;
+/// The client is built ONCE per run by the caller — a fresh `reqwest::Client`
+/// per file pays TLS/session setup every time.
+async fn fetch_attachment(client: &reqwest::Client, url: &str) -> Result<Vec<u8>> {
     let bytes = client
         .get(url)
         .send()
@@ -212,14 +214,40 @@ pub async fn dc_download(ctx: &DcCtx, opts: DownloadOpts<'_>) -> ExitCode {
             .unwrap_or_else(|_| "media".into())
     });
 
+    // One HTTP client + one prepared-statement batch for the whole run.
+    let http = match reqwest::Client::builder()
+        .user_agent(discord_core::stealth::browser_user_agent())
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("error building HTTP client: {e}");
+            return ExitCode::from(exit::ERROR);
+        }
+    };
+    // channel_id → (guild_name, channel_name): the two name lookups were
+    // repeated identically for every attachment in the same channel.
+    let mut name_cache: std::collections::HashMap<String, (String, String)> =
+        std::collections::HashMap::new();
+    // (attachment_id, local_path) marks, flushed in one prepared batch.
+    let mut marks: Vec<(String, String)> = Vec::new();
+
     let mut downloaded = 0usize;
     let mut skipped = 0usize;
     for a in &rows {
         // Destination: <out>/<guild>/<channel>/<msgID8>_<filename>.
-        let guild_name = ddb::guild_name_for_channel(&conn, &a.channel_id)
-            .unwrap_or_else(|_| "unknown".to_string());
-        let ch_name =
-            ddb::channel_name(&conn, &a.channel_id).unwrap_or_else(|_| a.channel_id.clone());
+        let (guild_name, ch_name) = match name_cache.get(&a.channel_id) {
+            Some(v) => v.clone(),
+            None => {
+                let guild_name = ddb::guild_name_for_channel(&conn, &a.channel_id)
+                    .unwrap_or_else(|_| "unknown".to_string());
+                let ch_name = ddb::channel_name(&conn, &a.channel_id)
+                    .unwrap_or_else(|_| a.channel_id.clone());
+                name_cache.insert(a.channel_id.clone(), (guild_name.clone(), ch_name.clone()));
+                (guild_name, ch_name)
+            }
+        };
         let dir = std::path::Path::new(&out_root)
             .join(sanitise_name(&guild_name))
             .join(sanitise_name(&ch_name));
@@ -251,13 +279,12 @@ pub async fn dc_download(ctx: &DcCtx, opts: DownloadOpts<'_>) -> ExitCode {
         let local = dir.join(format!("{suffix}_{}", safe_filename(&a.filename)));
         if local.exists() {
             skipped += 1;
-            let _ =
-                discord_db::attachments::mark_downloaded(&conn, &a.id, &local.to_string_lossy());
+            marks.push((a.id.clone(), local.to_string_lossy().into_owned()));
             continue;
         }
         // Progress to stderr (Escape-Tech \r\x1b[K pattern).
         eprint!("\rDownloading {}... ", local.display());
-        match fetch_attachment(&a.url).await {
+        match fetch_attachment(&http, &a.url).await {
             Ok(bytes) => {
                 // Content-Length may be absent/lied about — enforce the cap
                 // on the actual bytes received too.
@@ -277,11 +304,7 @@ pub async fn dc_download(ctx: &DcCtx, opts: DownloadOpts<'_>) -> ExitCode {
                     eprintln!("\rfailed to write {}: {e}", local.display());
                     continue;
                 }
-                let _ = discord_db::attachments::mark_downloaded(
-                    &conn,
-                    &a.id,
-                    &local.to_string_lossy(),
-                );
+                marks.push((a.id.clone(), local.to_string_lossy().into_owned()));
                 downloaded += 1;
             }
             Err(e) => {
@@ -292,6 +315,11 @@ pub async fn dc_download(ctx: &DcCtx, opts: DownloadOpts<'_>) -> ExitCode {
         // 200ms pacing between downloads (langkurt download.go:77).
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     }
+
+    // One prepared UPDATE for every downloaded file (was: prepare per row).
+    // Files already on disk are re-marked on the next run via the
+    // `local.exists()` branch, so a lost tail is self-healing.
+    let _ = discord_db::attachments::mark_downloaded_batch(&conn, &marks);
 
     let data = serde_json::json!({
         "downloaded": downloaded,
@@ -319,6 +347,11 @@ mod tests {
         assert!(parse_since("0h").is_none());
         assert!(parse_since("bogus").is_none());
         assert!(parse_since("2w").is_none());
+        // Non-ASCII / empty inputs must not panic on the unit-char split.
+        assert!(parse_since("café").is_none());
+        assert!(parse_since("1é").is_none());
+        assert!(parse_since("30").is_none());
+        assert!(parse_since("").is_none());
     }
 
     #[test]
